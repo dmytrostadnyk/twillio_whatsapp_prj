@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    name: Lint + Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run ruff linter
+        run: ruff check .
+
+      - name: Check black formatting
+        run: black --check .
+
+      - name: Run tests (unit only — no real DB in CI)
+        # Integration tests need a real Supabase DB, so we only run unit tests in CI.
+        # To run integration tests locally: make test-integration (with DATABASE_URL set)
+        env:
+          # Provide fake env values so config loads without erroring
+          TWILIO_ACCOUNT_SID: ACtest00000000000000000000000000000
+          TWILIO_AUTH_TOKEN: test_auth_token
+          TWILIO_PHONE_NUMBER: "+15550000000"
+          TWILIO_WHATSAPP_NUMBER: "whatsapp:+14155238886"
+          SUPABASE_URL: https://fake.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: fake_service_role_key
+          DATABASE_URL: postgresql://fake:fake@localhost:5432/fake
+          OPENAI_API_KEY: sk-fake
+          COHERE_API_KEY: fake
+          DEEPGRAM_API_KEY: fake
+          AZURE_CRM_URL: http://localhost:8001
+          AI_ENABLED: "false"
+          PUBLIC_BASE_URL: https://fake.ngrok-free.app
+        run: pytest tests/unit -v --no-cov

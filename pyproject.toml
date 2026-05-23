@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twilio-comm-intelligence"
+version = "0.1.0"
+description = "Production-grade Twilio communication layer with decoupled AI intelligence"
+requires-python = ">=3.11"
+dependencies = [
+    # ── Web framework ──────────────────────────────────────────────────────────
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # ── Data models & settings ─────────────────────────────────────────────────
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # ── Database ───────────────────────────────────────────────────────────────
+    "asyncpg>=0.30.0",          # raw SQL for SELECT FOR UPDATE SKIP LOCKED
+    "supabase>=2.10.0",         # higher-level CRUD operations
+    # ── Telephony ──────────────────────────────────────────────────────────────
+    "twilio>=9.3.0",
+    # ── AI providers ───────────────────────────────────────────────────────────
+    "openai>=1.55.0",           # GPT-4o enrichment + embeddings
+    "cohere>=5.11.0",           # semantic search reranking
+    "deepgram-sdk>=3.7.0",      # real-time streaming STT
+    # ── HTTP client (workers making outbound requests) ─────────────────────────
+    "httpx>=0.28.0",
+    # ── WebSocket support ──────────────────────────────────────────────────────
+    "websockets>=13.1",
+    # ── Structured JSON logging ────────────────────────────────────────────────
+    "structlog>=24.4.0",
+    # ── Dashboard ──────────────────────────────────────────────────────────────
+    "streamlit>=1.40.0",
+    # ── Retry / backoff utilities ──────────────────────────────────────────────
+    "tenacity>=9.0.0",
+    # ── Python-dotenv (load .env in dev) ──────────────────────────────────────
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",           # async test client for FastAPI
+    "respx>=0.21.0",           # mock httpx in tests
+    "ruff>=0.8.0",
+    "black>=24.10.0",
+    "mypy>=1.13.0",
+    "pre-commit>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["comm_layer*", "delivery_worker*", "intelligence_layer*", "mock_azure_crm*", "dashboard*"]
+
+# ── Ruff linting ───────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "N", "ANN001", "ANN201"]
+ignore = ["ANN001", "ANN201"]   # relax annotation rules for prototype speed
+
+# ── Black formatting ───────────────────────────────────────────────────────────
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# ── Mypy type checking ─────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true   # external stubs often missing; tighten in prod
+
+# ── Pytest ─────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=comm_layer --cov=delivery_worker --cov-report=term-missing"
