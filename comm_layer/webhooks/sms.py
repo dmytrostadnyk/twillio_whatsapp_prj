@@ -26,12 +26,10 @@ from comm_layer.deps import get_broker, get_pool
 from comm_layer.number_registry import resolve_source
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
+from comm_layer.webhooks.responses import EMPTY_TWIML
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
-
-# Empty TwiML response — tells Twilio "received, no auto-reply"
-_EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 
 @router.post("/sms", response_class=Response)
@@ -51,16 +49,20 @@ async def receive_sms(
     - NumMedia:   number of attachments (0 for plain SMS)
     """
     message_sid = form.get("MessageSid") or form.get("SmsSid", "")
-    from_number = form.get("From", "")
-    to_number = form.get("To", "")
+    # Coerce empty strings to None so the DB stores NULL — analytics queries
+    # using `WHERE from_number IS NOT NULL` must not match these rows.
+    from_number = form.get("From") or None
+    to_number = form.get("To") or None
 
     if not message_sid:
         # Malformed payload — Twilio always sends MessageSid, so this
         # indicates a fake or malformed request that passed signature check.
         log.warning("sms.missing_message_sid", form_keys=list(form.keys()))
-        return Response(content=_EMPTY_TWIML, media_type="application/xml")
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
 
-    source = await resolve_source(pool, to_number)
+    # For inbound SMS the destination (to_number) is our Twilio number — that's
+    # what we look up in the registry to know which business owns this traffic.
+    source = await resolve_source(pool, to_number or "")
     correlation_id = uuid.uuid4()
 
     await ingest_event(
@@ -77,4 +79,4 @@ async def receive_sms(
         correlation_id=correlation_id,
     )
 
-    return Response(content=_EMPTY_TWIML, media_type="application/xml")
+    return Response(content=EMPTY_TWIML, media_type="application/xml")

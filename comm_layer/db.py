@@ -20,6 +20,8 @@ Usage in FastAPI lifespan:
 
 from __future__ import annotations
 
+import json
+
 import asyncpg
 import structlog
 from supabase import AsyncClient, acreate_client
@@ -27,6 +29,30 @@ from supabase import AsyncClient, acreate_client
 from comm_layer.config import settings
 
 log = structlog.get_logger(__name__)
+
+
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    """
+    Register a JSONB codec on every new connection in the pool.
+
+    WHY: asyncpg returns JSONB columns as raw strings by default. Any code that
+    reads `raw_payload` (or any jsonb column) back as a dict would have to call
+    json.loads() manually — easy to forget, and a single missed spot becomes a
+    crash. Registering once at connection setup means asyncpg returns native
+    dicts/lists for jsonb columns everywhere in the codebase.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 async def create_pool() -> asyncpg.Pool:
@@ -43,6 +69,7 @@ async def create_pool() -> asyncpg.Pool:
         min_size=2,
         max_size=10,
         command_timeout=30,    # raise an error if a single query takes > 30s
+        init=_init_connection,
     )
     log.info("db.pool_created", min_size=2, max_size=10)
     return pool

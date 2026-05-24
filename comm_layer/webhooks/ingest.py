@@ -14,7 +14,6 @@ Twilio stops retrying. No duplicate rows. No duplicate deliveries.
 
 from __future__ import annotations
 
-import json
 import uuid
 
 import asyncpg
@@ -52,9 +51,14 @@ async def ingest_event(
     Checking then inserting has a race condition: two simultaneous Twilio
     retries could both pass the check and both insert. Using the unique
     constraint as the lock eliminates that race entirely.
+
+    WHY we bind correlation_id BEFORE the insert and re-bind on duplicate:
+    For new events we want the supplied id in the logs. For duplicates we
+    want the ORIGINAL id (from the first successful insert) so the duplicate
+    log line is traceable to the real event in the DB, not to a phantom UUID.
     """
-    # Bind correlation_id to structlog context so it appears in every log line
-    # for this request without having to pass it manually everywhere.
+    # Tentatively bind the supplied correlation_id; we'll overwrite it for
+    # duplicates once we know the original id from the DB.
     structlog.contextvars.bind_contextvars(
         correlation_id=str(correlation_id),
         event_key=event_key,
@@ -96,15 +100,24 @@ async def ingest_event(
             event_type,
             from_number,
             to_number,
-            json.dumps(source.model_dump()),
-            json.dumps(raw_payload),
+            source.model_dump(),
+            raw_payload,
             correlation_id,
         )
 
-    if row is None:
-        # Duplicate delivery from Twilio — already processed, safe to ignore
-        log.info("ingest.duplicate_ignored", event_key=event_key)
-        return False
+        if row is None:
+            # Duplicate delivery from Twilio. Fetch the ORIGINAL correlation_id
+            # so this log line ties back to the real DB row, not a phantom UUID.
+            original = await conn.fetchrow(
+                "SELECT correlation_id FROM comm_events WHERE event_key = $1",
+                event_key,
+            )
+            if original is not None:
+                structlog.contextvars.bind_contextvars(
+                    correlation_id=str(original["correlation_id"]),
+                )
+            log.info("ingest.duplicate_ignored", event_key=event_key)
+            return False
 
     # New event — publish to broker so the delivery worker picks it up
     await broker.publish(row["id"])

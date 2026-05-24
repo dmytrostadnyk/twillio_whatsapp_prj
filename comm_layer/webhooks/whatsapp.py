@@ -26,11 +26,10 @@ from comm_layer.deps import get_broker, get_pool
 from comm_layer.number_registry import resolve_source
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
+from comm_layer.webhooks.responses import EMPTY_TWIML
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
-
-_EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 
 @router.post("/whatsapp", response_class=Response)
@@ -46,15 +45,15 @@ async def receive_whatsapp(
     We preserve this in the DB so consumers can tell WhatsApp from SMS.
     """
     message_sid = form.get("MessageSid") or form.get("SmsSid", "")
-    from_number = form.get("From", "")  # e.g. whatsapp:+15559876543
-    to_number = form.get("To", "")       # e.g. whatsapp:+14155238886
+    from_number = form.get("From") or None  # e.g. whatsapp:+15559876543
+    to_number = form.get("To") or None      # e.g. whatsapp:+14155238886
 
     if not message_sid:
         log.warning("whatsapp.missing_message_sid", form_keys=list(form.keys()))
-        return Response(content=_EMPTY_TWIML, media_type="application/xml")
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
 
     # Strip 'whatsapp:' prefix for registry lookup — the registry stores plain E.164
-    plain_to = to_number.replace("whatsapp:", "")
+    plain_to = (to_number or "").replace("whatsapp:", "")
     source = await resolve_source(pool, plain_to)
 
     correlation_id = uuid.uuid4()
@@ -73,4 +72,4 @@ async def receive_whatsapp(
         correlation_id=correlation_id,
     )
 
-    return Response(content=_EMPTY_TWIML, media_type="application/xml")
+    return Response(content=EMPTY_TWIML, media_type="application/xml")

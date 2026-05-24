@@ -31,7 +31,7 @@ log = structlog.get_logger(__name__)
 
 async def require_twilio_signature(
     request: Request,
-    x_twilio_signature: str = Header(),
+    x_twilio_signature: str | None = Header(default=None),
 ) -> dict[str, str]:
     """
     FastAPI dependency: validates X-Twilio-Signature on every inbound webhook.
@@ -40,9 +40,21 @@ async def require_twilio_signature(
     so they don't need to call request.form() a second time.
 
     Raises HTTP 403 if the signature is missing or invalid.
-    WHY fail closed (403 not 200): silently accepting unsigned requests would
-    let anyone inject fake events into the system.
+
+    WHY both "missing" and "invalid" return 403 (not 422 for missing):
+    Both cases are security failures — an attacker pinging without a signature
+    and an attacker forging a bad one are the same incident class. Returning
+    one status code for both means our security monitoring can alert on a
+    single signal. FastAPI would default to 422 for a missing required header,
+    which would split the signal across two status codes for no good reason.
+
+    WHY fail closed: silently accepting unsigned requests would let anyone on
+    the internet inject fake Twilio events into the system.
     """
+    if not x_twilio_signature:
+        log.warning("twilio.signature_missing", path=request.url.path)
+        raise HTTPException(status_code=403, detail="Missing Twilio signature")
+
     # Read and cache the form data (Starlette caches this on the request object)
     form_data = await request.form()
     params = dict(form_data)

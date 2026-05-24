@@ -4,12 +4,15 @@ Webhook handler tests — Phase 1.
 What we test here:
 1. Valid inbound SMS → 200, TwiML response, event persisted, broker notified
 2. Duplicate SMS (same MessageSid) → 200, second insert silently ignored
-3. Invalid Twilio signature → 403
-4. Missing signature header → 422 (FastAPI rejects it before our code runs)
-5. Unknown to_number (not in registry) → 200, event still captured
-6. Malformed payload (missing MessageSid) → 200 with empty TwiML (graceful)
-7. Valid inbound voice call → 200, TwiML with greeting
-8. Valid inbound WhatsApp → 200, TwiML response
+3. Duplicate SMS keeps the ORIGINAL correlation_id (not a new one)
+4. Invalid Twilio signature → 403
+5. Missing signature header → 403 (NOT 422 — both failures are security incidents)
+6. Unknown to_number (not in registry) → 200, event still captured
+7. Malformed payload (missing MessageSid) → 200 with empty TwiML (graceful)
+8. Missing From/To → stored as NULL in DB, never empty string
+9. Valid inbound voice call → 200, TwiML with greeting
+10. Valid inbound WhatsApp → 200, TwiML response
+11. Voice status with Direction=outbound-api → recorded as outbound
 
 We mock the DB pool and broker so no real database is needed.
 The Twilio signature validation is NOT mocked — it runs end-to-end
@@ -19,7 +22,7 @@ using real HMAC-SHA1 with the test auth token.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -29,6 +32,36 @@ from tests.fixtures.twilio_fixtures import (
     signed_voice_payload,
     signed_whatsapp_payload,
 )
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def make_fetchrow_handler(
+    *,
+    insert_returns: dict | None,
+    existing_correlation_id: uuid.UUID | None = None,
+):
+    """
+    Build a clean async side_effect for mock_conn.fetchrow.
+
+    WHY a helper: every test wires up the same three query branches —
+    number_registry lookup, the INSERT INTO comm_events, and the duplicate
+    SELECT correlation_id lookup. Centralising means one fix updates every test.
+    """
+
+    async def handler(query: str, *args):
+        if "number_registry" in query:
+            return None
+        if "INSERT INTO comm_events" in query:
+            return insert_returns
+        if "SELECT correlation_id FROM comm_events" in query:
+            if existing_correlation_id is None:
+                return None
+            return {"correlation_id": existing_correlation_id}
+        return None
+
+    return handler
+
 
 # ── Test app fixture ───────────────────────────────────────────────────────────
 
@@ -43,27 +76,14 @@ async def client(mock_asyncpg_pool):
     """
     mock_pool, mock_conn = mock_asyncpg_pool
 
-    # When broker.publish() is called, just return None (async no-op)
     mock_broker = AsyncMock()
     mock_broker.publish = AsyncMock(return_value=None)
 
-    # fetchrow for number_registry lookup → return None (unknown number)
-    # fetchrow for comm_events INSERT → return a fake row with an id
+    # Default: registry returns nothing (unknown number), INSERT succeeds (new event).
     event_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-
-    def fetchrow_side_effect(query, *args):
-        """
-        Simulate DB responses based on which query is being run.
-        - number_registry SELECT → None (unknown number, but event still captured)
-        - comm_events INSERT → return a row with an id (new event)
-        """
-        if "number_registry" in query:
-            return AsyncMock(return_value=None)()
-        if "INSERT INTO comm_events" in query:
-            return AsyncMock(return_value={"id": event_id})()
-        return AsyncMock(return_value=None)()
-
-    mock_conn.fetchrow = MagicMock(side_effect=fetchrow_side_effect)
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
     mock_conn.fetchval = AsyncMock(return_value=1)  # for health check
 
     from comm_layer.deps import get_broker, get_pool
@@ -117,7 +137,6 @@ async def test_sms_event_is_persisted(client):
         headers={"x-twilio-signature": signature},
     )
 
-    # Verify comm_events INSERT was called
     insert_calls = [
         call for call in mock_conn.fetchrow.call_args_list
         if "INSERT INTO comm_events" in str(call)
@@ -149,11 +168,10 @@ async def test_sms_duplicate_returns_200_without_second_insert(client):
     """
     ac, mock_conn, _ = client
 
-    # Override fetchrow: INSERT returns None → duplicate
-    mock_conn.fetchrow = MagicMock(side_effect=lambda query, *args: (
-        AsyncMock(return_value=None)() if "INSERT INTO comm_events" in query
-        else AsyncMock(return_value=None)()
-    ))
+    # Override: INSERT returns None → duplicate. No existing row needed for this test.
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns=None)
+    )
 
     duplicate_broker = AsyncMock()
     from comm_layer.deps import get_broker
@@ -168,8 +186,39 @@ async def test_sms_duplicate_returns_200_without_second_insert(client):
     )
 
     assert response.status_code == 200
-    # Broker should NOT be called because the event was a duplicate
     duplicate_broker.publish.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sms_duplicate_looks_up_original_correlation_id(client):
+    """
+    On duplicate, ingest_event must SELECT the original correlation_id so logs
+    tie back to the real DB row, not a phantom UUID from the duplicate request.
+    """
+    ac, mock_conn, _ = client
+
+    original_cid = uuid.UUID("11111111-2222-3333-4444-555555555555")
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(
+            insert_returns=None,
+            existing_correlation_id=original_cid,
+        )
+    )
+
+    params, signature = signed_sms_payload(message_sid="SM_DUP_TRACE")
+    response = await ac.post(
+        "/webhooks/sms",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    # Confirm the duplicate path queried for the original correlation_id
+    correlation_lookups = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "SELECT correlation_id FROM comm_events" in str(call)
+    ]
+    assert len(correlation_lookups) == 1
 
 
 @pytest.mark.asyncio
@@ -188,14 +237,18 @@ async def test_sms_invalid_signature_returns_403(client):
 
 
 @pytest.mark.asyncio
-async def test_sms_missing_signature_returns_422(client):
-    """A request with no X-Twilio-Signature header is rejected by FastAPI (422)."""
+async def test_sms_missing_signature_returns_403(client):
+    """
+    A request with no X-Twilio-Signature header is rejected with 403 — NOT 422.
+    Both 'missing' and 'invalid' are security failures and must produce the
+    same status code so monitoring can alert on a single signal.
+    """
     ac, _, _ = client
     params, _ = signed_sms_payload()
 
     response = await ac.post("/webhooks/sms", data=params)  # no signature header
 
-    assert response.status_code == 422
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -206,18 +259,10 @@ async def test_sms_unknown_number_still_captured(client):
     """
     ac, mock_conn, mock_broker = client
 
-    # Simulate: number_registry returns nothing → unknown number
-    # comm_events INSERT succeeds → new event
     event_id = uuid.uuid4()
-
-    def fetchrow_unknown(query, *args):
-        if "number_registry" in query:
-            return AsyncMock(return_value=None)()
-        if "INSERT INTO comm_events" in query:
-            return AsyncMock(return_value={"id": event_id})()
-        return AsyncMock(return_value=None)()
-
-    mock_conn.fetchrow = MagicMock(side_effect=fetchrow_unknown)
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
 
     params, signature = signed_sms_payload(to_number="+15550000099")
     response = await ac.post(
@@ -226,9 +271,7 @@ async def test_sms_unknown_number_still_captured(client):
         headers={"x-twilio-signature": signature},
     )
 
-    # Must return 200 — unknown number is NOT a reason to reject
     assert response.status_code == 200
-    # Broker publish was called — event was captured
     mock_broker.publish.assert_called()
 
 
@@ -239,7 +282,6 @@ async def test_sms_malformed_payload_no_sid_returns_200(client):
     We never return 5xx to Twilio — it would keep retrying.
     """
     ac, _, _ = client
-    # Build a payload without MessageSid, then sign it
     from tests.fixtures.twilio_fixtures import TEST_BASE_URL, make_signature
 
     bad_params = {"From": "+15559876543", "To": "+15551234567", "Body": "test"}
@@ -253,6 +295,41 @@ async def test_sms_malformed_payload_no_sid_returns_200(client):
     )
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_sms_missing_from_and_to_passed_as_none_to_insert(client):
+    """
+    If From/To are missing in the form, the INSERT must receive None — not "".
+    Empty string in a nullable column silently breaks `IS NULL` analytics.
+    """
+    ac, mock_conn, _ = client
+    from tests.fixtures.twilio_fixtures import TEST_BASE_URL, make_signature
+
+    # Only MessageSid present — no From, no To
+    params = {"MessageSid": "SM_NO_NUMBERS", "Body": "hi"}
+    url = f"{TEST_BASE_URL}/webhooks/sms"
+    sig = make_signature(url, params)
+
+    response = await ac.post(
+        "/webhooks/sms",
+        data=params,
+        headers={"x-twilio-signature": sig},
+    )
+    assert response.status_code == 200
+
+    # Find the INSERT call and verify positions 5 (from_number) and 6 (to_number) are None
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    args = insert_calls[0].args
+    # args[0] is the SQL query; positional params follow
+    from_number_arg = args[5]
+    to_number_arg = args[6]
+    assert from_number_arg is None, f"from_number must be None, got {from_number_arg!r}"
+    assert to_number_arg is None, f"to_number must be None, got {to_number_arg!r}"
 
 
 # ── Voice tests ────────────────────────────────────────────────────────────────
@@ -287,6 +364,44 @@ async def test_voice_invalid_signature_returns_403(client):
     )
 
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_voice_status_outbound_direction_recorded(client):
+    """
+    A voice status callback with Direction=outbound-api must be persisted with
+    direction='outbound', NOT 'inbound'. Hardcoding inbound corrupts analytics
+    the moment we make our first outbound call (Phase 4).
+    """
+    ac, mock_conn, _ = client
+    from tests.fixtures.twilio_fixtures import TEST_BASE_URL, make_signature
+
+    params = {
+        "CallSid": "CA_outbound_demo",
+        "AccountSid": "ACtest00000000000000000000000000000",
+        "From": "+15551234567",  # our number
+        "To": "+15559876543",    # the customer
+        "CallStatus": "completed",
+        "Direction": "outbound-api",
+    }
+    url = f"{TEST_BASE_URL}/webhooks/voice/status"
+    sig = make_signature(url, params)
+
+    response = await ac.post(
+        "/webhooks/voice/status",
+        data=params,
+        headers={"x-twilio-signature": sig},
+    )
+    assert response.status_code == 200
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    # args: 0=sql, 1=event_key, 2=channel, 3=direction, 4=event_type, 5=from, 6=to, ...
+    direction_arg = insert_calls[0].args[3]
+    assert direction_arg == "outbound", f"expected outbound, got {direction_arg!r}"
 
 
 # ── WhatsApp tests ─────────────────────────────────────────────────────────────

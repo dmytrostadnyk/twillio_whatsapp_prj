@@ -24,16 +24,10 @@ from comm_layer.deps import get_broker, get_pool
 from comm_layer.number_registry import resolve_source
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
+from comm_layer.webhooks.responses import VOICE_GREETING_TWIML
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
-
-# TwiML response for inbound calls — a simple greeting while we capture the event.
-# Phase 5 will replace this with a <Record> verb.
-_VOICE_TWIML = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="alice">Thank you for calling. Please hold while we connect you.</Say>
-</Response>"""
 
 
 @router.post("/voice", response_class=Response)
@@ -52,14 +46,14 @@ async def receive_call(
     - CallStatus: current status (ringing, in-progress, etc.)
     """
     call_sid = form.get("CallSid", "")
-    from_number = form.get("From", "")
-    to_number = form.get("To", "")
+    from_number = form.get("From") or None
+    to_number = form.get("To") or None
 
     if not call_sid:
         log.warning("voice.missing_call_sid", form_keys=list(form.keys()))
-        return Response(content=_VOICE_TWIML, media_type="application/xml")
+        return Response(content=VOICE_GREETING_TWIML, media_type="application/xml")
 
-    source = await resolve_source(pool, to_number)
+    source = await resolve_source(pool, to_number or "")
     correlation_id = uuid.uuid4()
 
     await ingest_event(
@@ -76,4 +70,4 @@ async def receive_call(
         correlation_id=correlation_id,
     )
 
-    return Response(content=_VOICE_TWIML, media_type="application/xml")
+    return Response(content=VOICE_GREETING_TWIML, media_type="application/xml")
