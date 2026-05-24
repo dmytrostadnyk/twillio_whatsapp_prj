@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # ── Delivery worker tuning ──────────────────────────────────────────────────
     DELIVERY_MAX_ATTEMPTS: int = 8
     DELIVERY_BACKOFF_BASE_SECONDS: float = 5.0
+    # Cap on how long any single backoff can be. Without this, attempt counts
+    # in the double digits would compute multi-hour delays. 5 minutes is long
+    # enough to let Azure recover but short enough to keep the queue moving.
+    DELIVERY_BACKOFF_MAX_SECONDS: float = 300.0
     DELIVERY_POLL_INTERVAL_SECONDS: float = 5.0
     # How long a claimed row is hidden from other workers while being processed.
     # If the worker crashes before ack/nack, the row becomes claimable again

@@ -14,10 +14,11 @@ the Azure CRM endpoint with guaranteed delivery semantics.
 Reliability model:
   - Crash recovery: if the worker dies mid-processing, the lease on the claimed
     row expires (DELIVERY_LEASE_SECONDS) and another worker instance re-claims it.
-  - 4xx from Azure → dead-letter immediately. The schema is wrong; retrying
-    is pointless and would just eat up DELIVERY_MAX_ATTEMPTS for no reason.
-  - 5xx or timeout from Azure → retry with exponential backoff + jitter.
-    Azure is temporarily down or overloaded; we will get there eventually.
+  - 4xx from Azure (most codes) → dead-letter immediately. The payload is bad
+    and retrying will fail the same way. Exceptions are 408/425/429, which
+    are transient and DO get retried.
+  - 5xx, timeout, or network error → retry with exponential backoff + jitter.
+    If Azure sends a Retry-After header on 429/503, we honor it instead.
   - Max attempts: after DELIVERY_MAX_ATTEMPTS the event moves to 'dead'.
     Use scripts/replay_dlq.py to re-queue after fixing the root cause.
 """
@@ -41,9 +42,15 @@ from delivery_worker.transform import build_contract_payload
 
 log = structlog.get_logger(__name__)
 
-# ── Backoff ────────────────────────────────────────────────────────────────────
+# 4xx status codes that are actually transient and SHOULD be retried, per HTTP spec:
+#   408 Request Timeout — server gave up waiting for the request
+#   425 Too Early       — server unwilling to process replay-able request right now
+#   429 Too Many Requests — rate limit, retry with backoff
+# Every other 4xx means "your request is wrong" and we dead-letter immediately.
+_RETRYABLE_4XX = frozenset({408, 425, 429})
 
-_BACKOFF_MAX_SECONDS = 300.0  # cap at 5 minutes regardless of attempt count
+
+# ── Backoff ────────────────────────────────────────────────────────────────────
 
 
 def compute_backoff(attempt: int) -> float:
@@ -57,8 +64,31 @@ def compute_backoff(attempt: int) -> float:
 
     Formula: cap = min(base * 2^attempt, max); jitter = random(0, cap)
     """
-    cap = min(settings.DELIVERY_BACKOFF_BASE_SECONDS * (2 ** attempt), _BACKOFF_MAX_SECONDS)
+    cap = min(
+        settings.DELIVERY_BACKOFF_BASE_SECONDS * (2 ** attempt),
+        settings.DELIVERY_BACKOFF_MAX_SECONDS,
+    )
     return random.uniform(0, cap)
+
+
+def parse_retry_after(response: httpx.Response) -> float | None:
+    """
+    Parse the Retry-After header from an HTTP response.
+
+    Per RFC 7231 the value can be either a number of seconds or an HTTP-date.
+    We only handle the seconds form because that's what nearly every API uses
+    in practice; the HTTP-date form is rare enough to not be worth the parser.
+
+    Returns the delay in seconds, or None if the header is missing or unparseable.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        # HTTP-date form or garbage — fall back to our own backoff
+        return None
 
 
 # ── Per-message processing ─────────────────────────────────────────────────────
@@ -70,15 +100,17 @@ async def process_message(
     msg: BrokerMessage,
 ) -> None:
     """
-    Deliver one event to Azure CRM. Exactly three outcomes are possible:
-      1. Success (2xx)  → ack
-      2. Our schema bug (4xx) → dead-letter immediately
-      3. Azure down (5xx/timeout) → nack with backoff
+    Deliver one event to Azure CRM. Outcomes:
+      1. Success (2xx)                       → ack
+      2. Transient 4xx (408/425/429)         → nack (retry; Retry-After honored)
+      3. Other 4xx (schema/auth error)       → dead-letter immediately
+      4. 5xx                                 → nack (retry; Retry-After honored)
+      5. Network/timeout error               → nack (retry)
+      6. Max attempts exceeded               → dead-letter before any HTTP call
 
-    WHY we dead-letter on 4xx but retry on 5xx:
-    A 422 from Azure means our contract payload is malformed — retrying the
-    exact same payload will always fail. A 503 means Azure is temporarily
-    unavailable — the same payload will succeed once Azure recovers.
+    Tracing headers (X-Correlation-Id, X-Event-Key) are added to every request
+    so Azure CRM can correlate its own logs to events in our system without
+    parsing the body.
     """
     structlog.contextvars.bind_contextvars(
         event_key=msg.event_key,
@@ -96,44 +128,53 @@ async def process_message(
         return
 
     contract = build_contract_payload(msg)
+    headers = {
+        "X-Correlation-Id": str(msg.correlation_id),
+        "X-Event-Key": msg.event_key,
+    }
 
     try:
         response = await http_client.post(
             f"{settings.AZURE_CRM_URL}/events",
             json=contract,
+            headers=headers,
             timeout=10.0,
         )
-    except httpx.TimeoutException as exc:
+    except httpx.RequestError as exc:
+        # Covers TimeoutException, ConnectError, ReadError, WriteError, PoolTimeout,
+        # NetworkError — any I/O failure during the request. All retryable.
         backoff = compute_backoff(msg.attempt_count)
-        await broker.nack(msg.id, f"HTTP timeout: {exc}", backoff)
-        log.warning("delivery.timeout_retry", backoff_seconds=backoff)
-        return
-    except httpx.ConnectError as exc:
-        backoff = compute_backoff(msg.attempt_count)
-        await broker.nack(msg.id, f"Connection error: {exc}", backoff)
-        log.warning("delivery.connect_error_retry", backoff_seconds=backoff)
+        error_type = type(exc).__name__
+        await broker.nack(msg.id, f"{error_type}: {exc}", backoff)
+        log.warning("delivery.network_error_retry", error_type=error_type, backoff_seconds=backoff)
         return
 
     if response.status_code < 400:
         # Success — record the exact contract we shipped for auditability
         await broker.ack(msg.id, contract_payload=contract)
         log.info("delivery.success", http_status=response.status_code)
+        return
 
-    elif 400 <= response.status_code < 500:
-        # Our contract is wrong — retrying the same payload won't help
+    # Some 4xx codes are actually transient — treat them like 5xx
+    if 400 <= response.status_code < 500 and response.status_code not in _RETRYABLE_4XX:
+        # Real client error — retrying the same payload won't help
         reason = f"HTTP {response.status_code}: {response.text[:300]}"
         await broker.dead_letter(msg.id, reason)
         log.error("delivery.dead_lettered_4xx", http_status=response.status_code, reason=reason)
+        return
 
-    else:
-        # Azure is down or overloaded — retry later
-        backoff = compute_backoff(msg.attempt_count)
-        await broker.nack(msg.id, f"HTTP {response.status_code}", backoff)
-        log.warning(
-            "delivery.server_error_retry",
-            http_status=response.status_code,
-            backoff_seconds=backoff,
-        )
+    # All retryable cases: 5xx, 408, 425, 429.
+    # If Azure told us how long to wait, honor that; otherwise use our backoff.
+    retry_after = parse_retry_after(response)
+    backoff = retry_after if retry_after is not None else compute_backoff(msg.attempt_count)
+    reason = f"HTTP {response.status_code}: {response.text[:300]}"
+    await broker.nack(msg.id, reason, backoff)
+    log.warning(
+        "delivery.retry_scheduled",
+        http_status=response.status_code,
+        backoff_seconds=backoff,
+        honored_retry_after=retry_after is not None,
+    )
 
 
 # ── Poll loop ──────────────────────────────────────────────────────────────────
@@ -143,6 +184,12 @@ async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient) -> 
     """
     Main poll loop. Runs forever until a shutdown signal is received.
 
+    WHY clear contextvars at the top of each iteration:
+    structlog binds correlation_id/event_key per message. Without clearing,
+    the previous message's context lingers across the empty-queue sleep and
+    is attached to any unrelated error log — pointing investigators at the
+    wrong event. One clear per iteration costs nothing and prevents this.
+
     WHY sleep on empty queue instead of tight-looping:
     A tight loop would hit the DB thousands of times per second when the queue
     is empty, burning CPU and DB connection quota for nothing. Sleeping
@@ -151,6 +198,7 @@ async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient) -> 
     log.info("delivery_worker.started", poll_interval=settings.DELIVERY_POLL_INTERVAL_SECONDS)
 
     while True:
+        structlog.contextvars.clear_contextvars()
         try:
             msg = await broker.claim_next()
             if msg is None:
