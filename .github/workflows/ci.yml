@@ -27,7 +27,7 @@ jobs:
       - name: Run tests
         env:
           TWILIO_ACCOUNT_SID: ACtest00000000000000000000000000000
-          TWILIO_AUTH_TOKEN: test_auth_token
+          TWILIO_AUTH_TOKEN: test_auth_token_for_unit_tests_only
           TWILIO_PHONE_NUMBER: "+15550000000"
           TWILIO_WHATSAPP_NUMBER: "whatsapp:+14155238886"
           SUPABASE_URL: https://fake.supabase.co
