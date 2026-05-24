@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     DELIVERY_MAX_ATTEMPTS: int = 8
     DELIVERY_BACKOFF_BASE_SECONDS: float = 5.0
     DELIVERY_POLL_INTERVAL_SECONDS: float = 5.0
+    # How long a claimed row is hidden from other workers while being processed.
+    # If the worker crashes before ack/nack, the row becomes claimable again
+    # after this many seconds. Must be well above the expected processing time.
+    DELIVERY_LEASE_SECONDS: int = 60
 
     # ── Rate limiting ───────────────────────────────────────────────────────────
     ENRICHMENT_CONCURRENCY: int = 3

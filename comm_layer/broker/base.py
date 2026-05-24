@@ -30,13 +30,23 @@ class BrokerMessage:
 
     WHY a dataclass: lightweight, no Pydantic overhead, only used internally
     between the broker and the worker — never serialised over the wire.
+
+    All fields needed to build the versioned contract payload are included here
+    so the delivery worker never needs a second DB round-trip to fetch metadata.
     """
 
-    id: uuid.UUID          # the comm_events.id for this event
-    event_key: str         # natural idempotency key
+    id: uuid.UUID
+    event_key: str
     correlation_id: uuid.UUID
-    payload: dict[str, Any]  # the raw_payload from comm_events
+    channel: str                   # 'sms' | 'voice' | 'whatsapp'
+    direction: str                 # 'inbound' | 'outbound'
+    event_type: str                # e.g. 'sms.received', 'call.completed'
+    from_number: str | None
+    to_number: str | None
+    source_metadata: dict[str, Any]  # resolved at ingestion time
+    raw_payload: dict[str, Any]    # original Twilio form fields
     attempt_count: int
+    created_at: datetime
     claimed_at: datetime
 
 
@@ -74,8 +84,15 @@ class Broker(ABC):
         ...
 
     @abstractmethod
-    async def ack(self, event_id: uuid.UUID) -> None:
-        """Mark an event as successfully delivered. Removes it from the work queue."""
+    async def ack(
+        self, event_id: uuid.UUID, contract_payload: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Mark an event as successfully delivered.
+
+        If contract_payload is provided, it is written to comm_events.contract_payload
+        so there is an immutable record of exactly what was sent to the consumer.
+        """
         ...
 
     @abstractmethod

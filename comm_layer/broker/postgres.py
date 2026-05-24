@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import asyncpg
 import structlog
 
 from comm_layer.broker.base import Broker, BrokerMessage
+from comm_layer.config import settings
 
 log = structlog.get_logger(__name__)
 
@@ -62,13 +64,23 @@ class PostgresBroker(Broker):
 
         Returns None immediately if no events are ready — the caller should
         sleep before polling again (see delivery worker's poll loop).
+
+        WHY we set next_retry_at as a lease:
+        After the transaction commits, the FOR UPDATE lock is released. Without
+        a lease, the same row would immediately be visible to the next poll. By
+        setting next_retry_at = NOW() + DELIVERY_LEASE_SECONDS, the row is
+        hidden from other workers while we process it. If the worker crashes
+        before ack/nack, the lease expires and another worker re-claims the row.
         """
         async with self._pool.acquire() as conn:
-            # We must be in a transaction for FOR UPDATE to work correctly.
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT id, event_key, correlation_id, raw_payload, attempt_count
+                    SELECT id, event_key, correlation_id,
+                           channel, direction, event_type,
+                           from_number, to_number,
+                           source_metadata, raw_payload,
+                           attempt_count, created_at
                     FROM comm_events
                     WHERE delivery_status IN ('pending', 'failed')
                       AND (next_retry_at IS NULL OR next_retry_at <= NOW())
@@ -81,24 +93,32 @@ class PostgresBroker(Broker):
                 if row is None:
                     return None
 
-                # Bump attempt_count and mark as in-progress (we use 'failed' until ack'd
-                # to ensure the row is retried if the worker crashes mid-processing)
+                # Bump attempt_count and set the processing lease in one UPDATE.
                 await conn.execute(
                     """
                     UPDATE comm_events
-                    SET attempt_count = attempt_count + 1,
-                        updated_at = NOW()
+                    SET attempt_count   = attempt_count + 1,
+                        next_retry_at   = NOW() + ($2 || ' seconds')::INTERVAL,
+                        updated_at      = NOW()
                     WHERE id = $1
                     """,
                     row["id"],
+                    str(settings.DELIVERY_LEASE_SECONDS),
                 )
 
                 msg = BrokerMessage(
                     id=row["id"],
                     event_key=row["event_key"],
                     correlation_id=row["correlation_id"],
-                    payload=dict(row["raw_payload"]),
-                    attempt_count=row["attempt_count"] + 1,  # reflect the bump we just did
+                    channel=row["channel"],
+                    direction=row["direction"],
+                    event_type=row["event_type"],
+                    from_number=row["from_number"],
+                    to_number=row["to_number"],
+                    source_metadata=dict(row["source_metadata"]) if row["source_metadata"] else {},
+                    raw_payload=dict(row["raw_payload"]) if row["raw_payload"] else {},
+                    attempt_count=row["attempt_count"] + 1,
+                    created_at=row["created_at"],
                     claimed_at=datetime.now(UTC),
                 )
 
@@ -110,19 +130,28 @@ class PostgresBroker(Broker):
         )
         return msg
 
-    async def ack(self, event_id: uuid.UUID) -> None:
-        """Mark event as successfully delivered."""
+    async def ack(
+        self, event_id: uuid.UUID, contract_payload: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Mark event as successfully delivered.
+
+        contract_payload, if provided, is written to comm_events.contract_payload
+        so the DB has an immutable record of exactly what was sent to the consumer.
+        """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE comm_events
-                SET delivery_status = 'delivered',
-                    next_retry_at = NULL,
-                    last_error = NULL,
-                    updated_at = NOW()
+                SET delivery_status  = 'delivered',
+                    contract_payload = COALESCE($2::jsonb, contract_payload),
+                    next_retry_at    = NULL,
+                    last_error       = NULL,
+                    updated_at       = NOW()
                 WHERE id = $1
                 """,
                 event_id,
+                contract_payload,
             )
         log.info("broker.acked", event_id=str(event_id))
 
