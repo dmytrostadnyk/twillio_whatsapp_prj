@@ -116,6 +116,39 @@ def signed_whatsapp_status_payload(
     return params, signature
 
 
+def signed_recording_payload(
+    recording_sid: str = "RE1234567890abcdef",
+    call_sid: str = "CA1234567890abcdef",
+    recording_url: str = (
+        "https://api.twilio.com/2010-04-01/Accounts"
+        "/ACtest00000000000000000000000000000/Recordings/RE1234567890abcdef"
+    ),
+    recording_status: str = "completed",
+    recording_duration: str = "30",
+    path: str = "/webhooks/voice/recording",
+) -> tuple[dict[str, str], str]:
+    """
+    Returns (form_params, x_twilio_signature) for a recording-ready callback.
+
+    WHY no From/To fields:
+    Twilio's recordingStatusCallback POST does not include From or To — those
+    are only on the inbound call webhook. The handler explicitly sets both to None.
+    """
+    params = {
+        "AccountSid": "ACtest00000000000000000000000000000",
+        "CallSid": call_sid,
+        "RecordingSid": recording_sid,
+        "RecordingUrl": recording_url,
+        "RecordingStatus": recording_status,
+        "RecordingDuration": recording_duration,
+        "RecordingChannels": "1",
+        "RecordingSource": "RecordVerb",
+    }
+    url = f"{TEST_BASE_URL}{path}"
+    signature = make_signature(url, params)
+    return params, signature
+
+
 def signed_whatsapp_payload(
     message_sid: str = "SM1234567890abcdef",
     from_number: str = "whatsapp:+15559876543",

@@ -1,18 +1,28 @@
 """
-Webhook handler tests — Phase 1.
+Webhook handler tests — Phases 1, 4, and 5.
 
 What we test here:
-1. Valid inbound SMS → 200, TwiML response, event persisted, broker notified
-2. Duplicate SMS (same MessageSid) → 200, second insert silently ignored
-3. Duplicate SMS keeps the ORIGINAL correlation_id (not a new one)
-4. Invalid Twilio signature → 403
-5. Missing signature header → 403 (NOT 422 — both failures are security incidents)
-6. Unknown to_number (not in registry) → 200, event still captured
-7. Malformed payload (missing MessageSid) → 200 with empty TwiML (graceful)
-8. Missing From/To → stored as NULL in DB, never empty string
-9. Valid inbound voice call → 200, TwiML with greeting
+1.  Valid inbound SMS → 200, TwiML response, event persisted, broker notified
+2.  Duplicate SMS (same MessageSid) → 200, second insert silently ignored
+3.  Duplicate SMS keeps the ORIGINAL correlation_id (not a new one)
+4.  Invalid Twilio signature → 403
+5.  Missing signature header → 403 (NOT 422 — both failures are security incidents)
+6.  Unknown to_number (not in registry) → 200, event still captured
+7.  Malformed payload (missing MessageSid) → 200 with empty TwiML (graceful)
+8.  Missing From/To → stored as NULL in DB, never empty string
+9.  Valid inbound voice call → 200, TwiML with Say + Record
 10. Valid inbound WhatsApp → 200, TwiML response
 11. Voice status with Direction=outbound-api → recorded as outbound
+12. SMS status callback persisted as event, broker notified
+13. SMS status event_key includes the status value
+14. WhatsApp status callback persisted as event
+15. WhatsApp status event_key includes the status value
+16. Valid recording-ready callback → 200, event persisted
+17. Recording with RecordingStatus=absent → 200, event NOT persisted
+18. Recording with missing RecordingSid → 200, event NOT persisted
+19. Recording event_key is {RecordingSid}:recording.ready
+20. Recording-ready with invalid Twilio signature → 403
+21. Voice TwiML includes <Record> with recordingStatusCallback URL
 
 We mock the DB pool and broker so no real database is needed.
 The Twilio signature validation is NOT mocked — it runs end-to-end
@@ -28,6 +38,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from tests.fixtures.twilio_fixtures import (
+    signed_recording_payload,
     signed_sms_payload,
     signed_sms_status_payload,
     signed_voice_payload,
@@ -536,6 +547,175 @@ async def test_whatsapp_status_event_key_includes_status(client):
     event_key = insert_calls[0].args[1]
     assert "WA_specific" in event_key
     assert "read" in event_key
+
+
+# ── Voice recording tests (Phase 5) ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_voice_twiml_includes_record_verb(client):
+    """
+    After Phase 5, inbound calls must receive TwiML that includes a <Record> verb.
+    Without it, no recording is made — the caller hears the greeting and the call
+    ends with nothing captured.
+    """
+    ac, _, _ = client
+    params, signature = signed_voice_payload()
+
+    response = await ac.post(
+        "/webhooks/voice",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    assert "<Record" in response.text
+
+
+@pytest.mark.asyncio
+async def test_voice_twiml_record_has_status_callback_url(client):
+    """
+    The <Record> verb must include recordingStatusCallback pointing to our
+    handler. Without it, Twilio never POSTs the recording-ready notification and
+    the recording sits on Twilio's servers unprocessed forever.
+    """
+    ac, _, _ = client
+    params, signature = signed_voice_payload()
+
+    response = await ac.post(
+        "/webhooks/voice",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert "recordingStatusCallback" in response.text
+    assert "/webhooks/voice/recording" in response.text
+
+
+@pytest.mark.asyncio
+async def test_recording_ready_webhook_persists_event(client):
+    """Valid recording-ready callback → event is persisted and broker is notified."""
+    ac, mock_conn, mock_broker = client
+
+    event_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_recording_payload()
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    mock_broker.publish.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_recording_ready_event_key_uses_recording_sid(client):
+    """
+    The event_key must be {RecordingSid}:recording.ready so each recording
+    produces a unique, idempotent key. Using CallSid alone would collide if
+    a call has multiple recordings (which Twilio allows on re-record).
+    """
+    ac, mock_conn, _ = client
+
+    event_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_recording_payload(recording_sid="RE_specific")
+    await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    event_key = insert_calls[0].args[1]
+    assert event_key == "RE_specific:recording.ready"
+
+
+@pytest.mark.asyncio
+async def test_recording_absent_not_persisted(client):
+    """
+    RecordingStatus=absent means the caller hung up before speaking — no audio
+    file exists. We must NOT ingest this as an event because the intelligence
+    layer would try to fetch a file that doesn't exist.
+    """
+    ac, mock_conn, mock_broker = client
+
+    params, signature = signed_recording_payload(recording_status="absent")
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    # No INSERT should be attempted for absent recordings
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 0
+    mock_broker.publish.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recording_missing_sid_not_persisted(client):
+    """
+    A recording callback with no RecordingSid cannot form a valid event_key.
+    We return 200 (so Twilio doesn't retry) but do not ingest anything.
+    """
+    ac, mock_conn, mock_broker = client
+
+    from tests.fixtures.twilio_fixtures import TEST_BASE_URL, make_signature
+
+    params = {
+        "AccountSid": "ACtest00000000000000000000000000000",
+        "CallSid": "CA1234567890abcdef",
+        # RecordingSid intentionally omitted
+        "RecordingStatus": "completed",
+    }
+    url = f"{TEST_BASE_URL}/webhooks/voice/recording"
+    sig = make_signature(url, params)
+
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": sig},
+    )
+
+    assert response.status_code == 200
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 0
+    mock_broker.publish.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recording_invalid_signature_returns_403(client):
+    """Recording-ready callback also enforces Twilio signature validation."""
+    ac, _, _ = client
+    params, _ = signed_recording_payload()
+
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": "forged_sig"},
+    )
+
+    assert response.status_code == 403
 
 
 # ── Health check tests ─────────────────────────────────────────────────────────

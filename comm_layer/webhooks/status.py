@@ -1,5 +1,5 @@
 """
-Status callback handlers — SMS, WhatsApp, and Voice.
+Status callback handlers — SMS, WhatsApp, Voice, and Voice Recording.
 
 Twilio fires these when the status of an outbound message or a call changes.
 Status callbacks follow the same fast-ack pattern as inbound webhooks:
@@ -22,6 +22,11 @@ to_number (our Twilio number). For outbound, it uses from_number.
 
 SMS and WhatsApp status callbacks fire only for outbound messages, so the
 'from' field is always our number and direction is always 'outbound'.
+
+RECORDING-READY CALLBACK:
+The recording callback fires ASYNCHRONOUSLY after the call ends — Twilio takes
+a few seconds to encode the audio. It is a separate HTTP POST from the call
+status callback and arrives at /webhooks/voice/recording.
 """
 
 from __future__ import annotations
@@ -163,6 +168,78 @@ async def voice_status(
         event_type="call.completed",
         from_number=from_number,
         to_number=to_number,
+        source=source,
+        raw_payload=dict(form),
+        correlation_id=uuid.uuid4(),
+    )
+
+    return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+
+@router.post("/voice/recording", response_class=Response)
+async def voice_recording_ready(
+    form: Annotated[dict[str, str], Depends(require_twilio_signature)],
+    pool: Annotated[asyncpg.Pool, Depends(get_pool)],
+    broker: Annotated[Broker, Depends(get_broker)],
+) -> Response:
+    """
+    Recording-ready callback — fires when Twilio finishes encoding a recording.
+
+    WHY this is separate from voice_status:
+    call.completed fires immediately when the call ends (the phone hangs up).
+    Recording processing happens AFTER the call, on Twilio's servers. This
+    separate webhook fires only when the audio file is actually accessible —
+    typically a few seconds after call.completed but can be longer for long calls.
+    Trying to download the recording URL from call.completed would fail or return
+    incomplete audio because the file isn't ready yet.
+
+    WHY we skip 'absent' recordings:
+    RecordingStatus=absent means the caller hung up before leaving any audio, or
+    the recording was empty silence. There is no file to process, so we don't
+    create an event — the intelligence layer would have nothing to transcribe.
+
+    SECURITY — Secure Media:
+    The RecordingUrl in raw_payload (e.g. https://api.twilio.com/.../Recordings/RExxx)
+    requires HTTP Basic Auth (AccountSid:AuthToken) ONLY IF "Secure Media" is
+    enabled in the Twilio Console (Account Settings → Recordings → HTTP
+    authentication for media). Enable this before going live. Without it, anyone
+    with the URL can download the audio.
+
+    We store raw_payload as-is (including RecordingUrl) in the events table.
+    The URL is not exposed in any public API endpoint, so it is safe at rest.
+    The intelligence layer fetches the audio using authenticated requests.
+    """
+    recording_sid = form.get("RecordingSid", "")
+    recording_status = form.get("RecordingStatus", "")
+
+    if not recording_sid:
+        log.warning("voice_recording.missing_sid", form_keys=list(form.keys()))
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # 'absent' = caller hung up before speaking; no file was created.
+    # 'failed' = Twilio encoding error; no usable file.
+    # Only 'completed' means the audio file is ready.
+    if recording_status != "completed":
+        log.info(
+            "voice_recording.skipped",
+            recording_sid=recording_sid,
+            status=recording_status,
+        )
+        return Response(content=EMPTY_TWIML, media_type="application/xml")
+
+    # The recording callback does not include From/To — those are on the call
+    # webhook. Source is unknown here; the intelligence layer can join on CallSid.
+    source = await resolve_source(pool, "")
+
+    await ingest_event(
+        pool,
+        broker,
+        event_key=f"{recording_sid}:recording.ready",
+        channel="voice",
+        direction="inbound",
+        event_type="recording.ready",
+        from_number=None,
+        to_number=None,
         source=source,
         raw_payload=dict(form),
         correlation_id=uuid.uuid4(),

@@ -2,11 +2,11 @@
 Voice inbound webhook handler.
 
 Twilio calls POST /webhooks/voice when someone calls our number.
-We respond immediately with TwiML (a greeting) so the caller hears something
-while we persist the event in the background.
+We respond with TwiML that greets the caller and starts recording.
+The recording-ready callback arrives at /webhooks/voice/recording (status.py)
+once Twilio has finished encoding the audio file.
 
-Phase 5 will add recording — this handler will be updated then.
-Phase 6 will add real-time Media Streams transcription.
+Phase 6 will replace the <Record> verb with Media Streams for real-time transcription.
 """
 
 from __future__ import annotations
@@ -20,11 +20,12 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 
 from comm_layer.broker.base import Broker
+from comm_layer.config import settings
 from comm_layer.deps import get_broker, get_pool
 from comm_layer.number_registry import resolve_source
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
-from comm_layer.webhooks.responses import VOICE_GREETING_TWIML
+from comm_layer.webhooks.responses import make_voice_recording_twiml
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
@@ -49,9 +50,14 @@ async def receive_call(
     from_number = form.get("From") or None
     to_number = form.get("To") or None
 
+    twiml = make_voice_recording_twiml(
+        settings.PUBLIC_BASE_URL,
+        settings.MAX_RECORDING_DURATION_SECONDS,
+    )
+
     if not call_sid:
         log.warning("voice.missing_call_sid", form_keys=list(form.keys()))
-        return Response(content=VOICE_GREETING_TWIML, media_type="application/xml")
+        return Response(content=twiml, media_type="application/xml")
 
     source = await resolve_source(pool, to_number or "")
     correlation_id = uuid.uuid4()
@@ -70,4 +76,4 @@ async def receive_call(
         correlation_id=correlation_id,
     )
 
-    return Response(content=VOICE_GREETING_TWIML, media_type="application/xml")
+    return Response(content=twiml, media_type="application/xml")
