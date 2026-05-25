@@ -23,6 +23,12 @@ What we test here:
 19. Recording event_key is {RecordingSid}:recording.ready
 20. Recording-ready with invalid Twilio signature → 403
 21. Voice TwiML includes <Record> with recordingStatusCallback URL
+22. Recording.ready inherits correlation_id/direction/from/to/source from call.started
+23. Recording.ready falls back gracefully when call.started lookup misses
+24. Recording with RecordingStatus=failed → captured as recording.failed event
+25. Voice TwiML's maxLength attribute reflects the configured cost guardrail
+26. Voice TwiML callback URL is fully qualified (includes scheme+host)
+27. make_voice_recording_twiml XML-escapes special chars in the URL
 
 We mock the DB pool and broker so no real database is needed.
 The Twilio signature validation is NOT mocked — it runs end-to-end
@@ -53,13 +59,19 @@ def make_fetchrow_handler(
     *,
     insert_returns: dict | None,
     existing_correlation_id: uuid.UUID | None = None,
+    call_context: dict | None = None,
 ):
     """
     Build a clean async side_effect for mock_conn.fetchrow.
 
-    WHY a helper: every test wires up the same three query branches —
-    number_registry lookup, the INSERT INTO comm_events, and the duplicate
-    SELECT correlation_id lookup. Centralising means one fix updates every test.
+    WHY a helper: every test wires up the same query branches — number_registry
+    lookup, INSERT INTO comm_events, the duplicate SELECT correlation_id lookup,
+    and (Phase 5) the recording handler's call.started context lookup.
+    Centralising means one fix updates every test.
+
+    call_context — when set, returned for the recording handler's lookup_call_context
+    query. When None, that query returns None (simulates a recording arriving
+    without a matching call.started row).
     """
 
     async def handler(query: str, *args):
@@ -71,6 +83,8 @@ def make_fetchrow_handler(
             if existing_correlation_id is None:
                 return None
             return {"correlation_id": existing_correlation_id}
+        if "raw_payload->>'CallSid'" in query:
+            return call_context
         return None
 
     return handler
@@ -716,6 +730,204 @@ async def test_recording_invalid_signature_returns_403(client):
     )
 
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_recording_ready_inherits_context_from_call_started(client):
+    """
+    The recording.ready event must inherit correlation_id, direction,
+    from_number, to_number, and source from the originating call.started event.
+    Without this, log tracing breaks across the call → recording chain.
+
+    We use direction='outbound' in the call_context so the test proves
+    inheritance happened — the handler's fallback would set 'inbound'.
+    """
+    ac, mock_conn, _ = client
+
+    original_cid = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    original_source_metadata = {
+        "number": "+15551234567",
+        "source_type": "campaign",
+        "source_id": "demo-campaign-1",
+        "label": "Demo Campaign",
+        "is_unknown": False,
+        "metadata": {},
+    }
+    call_context = {
+        "correlation_id": original_cid,
+        "direction": "outbound",
+        "from_number": "+15551234567",
+        "to_number": "+15559876543",
+        "source_metadata": original_source_metadata,
+    }
+
+    event_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(
+            insert_returns={"id": event_id},
+            call_context=call_context,
+        )
+    )
+
+    params, signature = signed_recording_payload(call_sid="CA_with_origin")
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    args = insert_calls[0].args
+    # args layout: 0=sql, 1=event_key, 2=channel, 3=direction, 4=event_type,
+    #              5=from, 6=to, 7=source, 8=raw_payload, 9=correlation_id
+    assert args[3] == "outbound", "direction must be inherited from call.started"
+    assert args[5] == "+15551234567", "from_number must be inherited"
+    assert args[6] == "+15559876543", "to_number must be inherited"
+    assert args[9] == original_cid, "correlation_id must be inherited"
+    # source is passed via .model_dump() — verify the inherited fields are present
+    assert args[7]["source_id"] == "demo-campaign-1"
+    assert args[7]["is_unknown"] is False
+
+
+@pytest.mark.asyncio
+async def test_recording_ready_falls_back_when_no_originating_call(client):
+    """
+    If the originating call.started can't be found (out-of-order webhook, or
+    we somehow received a recording for a call we never persisted), we must
+    still ingest the event — never drop it — using safe placeholder values.
+    """
+    ac, mock_conn, mock_broker = client
+
+    event_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(
+            insert_returns={"id": event_id},
+            call_context=None,  # lookup misses
+        )
+    )
+
+    params, signature = signed_recording_payload()
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    # Event must still be ingested and published
+    mock_broker.publish.assert_called_once()
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    args = insert_calls[0].args
+    # Fallback values
+    assert args[3] == "inbound", "fallback direction must be 'inbound'"
+    assert args[5] is None, "from_number must be None when call context missing"
+    assert args[6] is None, "to_number must be None when call context missing"
+    assert args[7]["is_unknown"] is True, "source must be unknown when call context missing"
+
+
+@pytest.mark.asyncio
+async def test_recording_failed_persisted_as_distinct_event(client):
+    """
+    RecordingStatus=failed means Twilio's encoder broke — the audio is gone,
+    but we still capture an event for operational visibility (dashboard,
+    investigation, alerting). The event_type and event_key must differ from
+    a successful recording so dedup constraints don't collide.
+    """
+    ac, mock_conn, mock_broker = client
+
+    event_id = uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_recording_payload(
+        recording_sid="RE_failed_demo",
+        recording_status="failed",
+    )
+    response = await ac.post(
+        "/webhooks/voice/recording",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    mock_broker.publish.assert_called_once()
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    assert len(insert_calls) == 1
+    args = insert_calls[0].args
+    assert args[1] == "RE_failed_demo:recording.failed"
+    assert args[4] == "recording.failed"
+
+
+@pytest.mark.asyncio
+async def test_voice_twiml_includes_max_length(client):
+    """
+    The configured MAX_RECORDING_DURATION_SECONDS must end up in the TwiML's
+    maxLength attribute. Otherwise the env-tuned cost guardrail is decorative —
+    Twilio would default to 3600s regardless of what we set.
+    """
+    ac, _, _ = client
+    from comm_layer.config import settings
+
+    params, signature = signed_voice_payload()
+    response = await ac.post(
+        "/webhooks/voice",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert f'maxLength="{settings.MAX_RECORDING_DURATION_SECONDS}"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_voice_twiml_callback_url_is_fully_qualified(client):
+    """
+    The recordingStatusCallback URL must be a complete public URL. A relative
+    path or 'localhost' won't be reachable from Twilio's network — the recording
+    file is uploaded but the notification is never delivered.
+    """
+    ac, _, _ = client
+    from tests.fixtures.twilio_fixtures import TEST_BASE_URL
+
+    params, signature = signed_voice_payload()
+    response = await ac.post(
+        "/webhooks/voice",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    expected_url = f'{TEST_BASE_URL}/webhooks/voice/recording'
+    assert expected_url in response.text
+    assert "https://" in response.text
+
+
+def test_voice_twiml_xml_escapes_special_chars_in_url():
+    """
+    If base_url contains XML-special characters (e.g. '&' in a query string),
+    they must be escaped or Twilio rejects the entire response as malformed XML.
+    """
+    from comm_layer.webhooks.responses import make_voice_recording_twiml
+
+    twiml = make_voice_recording_twiml("https://example.com?a=1&b=2", 3600)
+    # The unescaped '&' must NOT appear (other than inside an entity reference)
+    assert "a=1&b=2" not in twiml
+    # The escaped form must be present
+    assert "a=1&amp;b=2" in twiml
 
 
 # ── Health check tests ─────────────────────────────────────────────────────────
