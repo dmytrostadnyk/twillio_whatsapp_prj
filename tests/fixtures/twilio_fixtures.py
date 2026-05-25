@@ -74,6 +74,48 @@ def signed_voice_payload(
     return params, signature
 
 
+def signed_sms_status_payload(
+    message_sid: str = "SM1234567890abcdef",
+    from_number: str = "+15551234567",
+    to_number: str = "+15559876543",
+    status: str = "delivered",
+    path: str = "/webhooks/sms/status",
+) -> tuple[dict[str, str], str]:
+    """Returns (form_params, x_twilio_signature) for an SMS status callback."""
+    params = {
+        "MessageSid": message_sid,
+        "SmsSid": message_sid,
+        "AccountSid": "ACtest00000000000000000000000000000",
+        "From": from_number,
+        "To": to_number,
+        "MessageStatus": status,
+    }
+    url = f"{TEST_BASE_URL}{path}"
+    signature = make_signature(url, params)
+    return params, signature
+
+
+def signed_whatsapp_status_payload(
+    message_sid: str = "SM1234567890abcdef",
+    from_number: str = "whatsapp:+14155238886",
+    to_number: str = "whatsapp:+15559876543",
+    status: str = "delivered",
+    path: str = "/webhooks/whatsapp/status",
+) -> tuple[dict[str, str], str]:
+    """Returns (form_params, x_twilio_signature) for a WhatsApp status callback."""
+    params = {
+        "MessageSid": message_sid,
+        "SmsSid": message_sid,
+        "AccountSid": "ACtest00000000000000000000000000000",
+        "From": from_number,
+        "To": to_number,
+        "MessageStatus": status,
+    }
+    url = f"{TEST_BASE_URL}{path}"
+    signature = make_signature(url, params)
+    return params, signature
+
+
 def signed_whatsapp_payload(
     message_sid: str = "SM1234567890abcdef",
     from_number: str = "whatsapp:+15559876543",

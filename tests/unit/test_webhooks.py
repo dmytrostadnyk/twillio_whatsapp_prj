@@ -29,8 +29,10 @@ from httpx import ASGITransport, AsyncClient
 
 from tests.fixtures.twilio_fixtures import (
     signed_sms_payload,
+    signed_sms_status_payload,
     signed_voice_payload,
     signed_whatsapp_payload,
+    signed_whatsapp_status_payload,
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -421,6 +423,123 @@ async def test_whatsapp_valid_returns_200(client):
 
     assert response.status_code == 200
     assert "<Response>" in response.text
+
+
+# ── Status callback tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sms_status_callback_is_persisted(client):
+    """
+    SMS delivery status callbacks must be ingested as their own events so the
+    dashboard can show queued → sent → delivered progression.
+    The event_key must embed the status so each transition is a unique row.
+    """
+    ac, mock_conn, mock_broker = client
+    import uuid as _uuid
+
+    event_id = _uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_sms_status_payload(status="delivered")
+    response = await ac.post(
+        "/webhooks/sms/status",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    # Event should be queued for delivery
+    mock_broker.publish.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sms_status_event_key_includes_status(client):
+    """
+    Two status transitions for the same SID (e.g. 'sent' then 'delivered')
+    must produce different event_keys so both rows are inserted. If the status
+    is not in the key, the second transition silently duplicates and is lost.
+    """
+    ac, mock_conn, _ = client
+    import uuid as _uuid
+
+    event_id = _uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_sms_status_payload(
+        message_sid="SM_specific", status="sent"
+    )
+    await ac.post(
+        "/webhooks/sms/status",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    event_key = insert_calls[0].args[1]
+    assert "SM_specific" in event_key
+    assert "sent" in event_key
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_status_callback_is_persisted(client):
+    """
+    WhatsApp status callbacks must be ingested — including 'read' receipts
+    (which SMS doesn't have). These feed the dashboard's message status column.
+    """
+    ac, mock_conn, mock_broker = client
+    import uuid as _uuid
+
+    event_id = _uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_whatsapp_status_payload(status="read")
+    response = await ac.post(
+        "/webhooks/whatsapp/status",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    assert response.status_code == 200
+    mock_broker.publish.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_status_event_key_includes_status(client):
+    """WhatsApp status event_key must include the status value."""
+    ac, mock_conn, _ = client
+    import uuid as _uuid
+
+    event_id = _uuid.uuid4()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
+    )
+
+    params, signature = signed_whatsapp_status_payload(
+        message_sid="WA_specific", status="read"
+    )
+    await ac.post(
+        "/webhooks/whatsapp/status",
+        data=params,
+        headers={"x-twilio-signature": signature},
+    )
+
+    insert_calls = [
+        call for call in mock_conn.fetchrow.call_args_list
+        if "INSERT INTO comm_events" in str(call)
+    ]
+    event_key = insert_calls[0].args[1]
+    assert "WA_specific" in event_key
+    assert "read" in event_key
 
 
 # ── Health check tests ─────────────────────────────────────────────────────────
