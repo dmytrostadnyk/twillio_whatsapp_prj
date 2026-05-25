@@ -42,7 +42,6 @@ class Settings(BaseSettings):
     # ── AI providers ────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str
     COHERE_API_KEY: str
-    DEEPGRAM_API_KEY: str
 
     # ── Mock Azure CRM ──────────────────────────────────────────────────────────
     AZURE_CRM_URL: str = "http://localhost:8001"

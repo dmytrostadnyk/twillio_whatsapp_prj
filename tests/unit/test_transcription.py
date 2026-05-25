@@ -4,15 +4,16 @@ Unit tests for comm_layer/transcription.py.
 What we test:
 1. AI kill switch: when AI_ENABLED=False, transcribe_recording returns early
    without making any network calls.
-2. Happy path: audio is downloaded, Deepgram returns a transcript with words,
+2. Happy path: audio is downloaded, Whisper returns a transcript with words,
    the result is written to the transcripts table.
-3. Exception in Deepgram: error is logged and NOT re-raised (background tasks
+3. Exception in Whisper: error is logged and NOT re-raised (background tasks
    must never propagate exceptions — they would be silently swallowed by the
    event loop anyway, but we log them explicitly so ops can see the failure).
-4. Empty response from Deepgram: Deepgram finds no speech (silence or noise) —
-   null text and empty segments are written to DB so the row still exists.
+4. Empty response from Whisper: no speech detected — null text and empty
+   segments are written to DB so the row still exists and Phase 7 won't
+   re-trigger transcription for the same recording.
 
-We mock httpx, DeepgramClient, and supabase so no real network calls are made.
+We mock httpx, OpenAI, and supabase so no real network calls are made.
 """
 
 from __future__ import annotations
@@ -32,31 +33,27 @@ FAKE_RECORDING_URL = "https://api.twilio.com/2010-04-01/Accounts/AC123/Recording
 FAKE_RECORDING_SID = "RE123"
 
 
-def make_deepgram_response(
-    transcript: str | None = "Hello world",
+def make_whisper_response(
+    text: str | None = "Hello world",
     words: list[dict] | None = None,
-) -> MagicMock:
+) -> SimpleNamespace:
     """
-    Build a mock Deepgram ListenV1Response with the minimum structure
-    that _run_deepgram_sync reads.
+    Build a mock Whisper verbose_json response with the structure that
+    _run_whisper_sync reads: .text (str) and .words (list of word objects).
     """
     if words is None:
         words = [
             {"word": "Hello", "start": 0.0, "end": 0.5},
             {"word": "world", "start": 0.6, "end": 1.0},
         ]
-
     mock_words = [
         SimpleNamespace(word=w["word"], start=w["start"], end=w["end"])
         for w in words
     ]
-    mock_alt = SimpleNamespace(transcript=transcript, words=mock_words)
-    mock_channel = SimpleNamespace(alternatives=[mock_alt])
-    mock_results = SimpleNamespace(channels=[mock_channel])
-    return SimpleNamespace(results=mock_results)
+    return SimpleNamespace(text=text, words=mock_words)
 
 
-def make_mock_supabase() -> AsyncMock:
+def make_mock_supabase():
     """Build a mock Supabase client that records the insert call."""
     mock_execute = AsyncMock(return_value=None)
     mock_insert = MagicMock()
@@ -68,6 +65,16 @@ def make_mock_supabase() -> AsyncMock:
     return mock_supabase, mock_execute, mock_table
 
 
+def make_mock_http_client(audio_content: bytes = b"fake_audio_bytes") -> AsyncMock:
+    """Build an httpx async client mock that returns the given audio bytes."""
+    mock_response = MagicMock()
+    mock_response.content = audio_content
+    mock_response.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    return mock_client
+
+
 # ── Tests ──────────────────────────────────────────────────────────────────────
 
 
@@ -75,14 +82,14 @@ def make_mock_supabase() -> AsyncMock:
 async def test_transcription_skipped_when_ai_disabled():
     """
     When AI_ENABLED=False (the default in tests), transcribe_recording must
-    return immediately without calling httpx or Deepgram.
+    return immediately without calling httpx or OpenAI.
     This proves the AI kill switch works at the transcription boundary.
     """
     mock_supabase, mock_execute, _ = make_mock_supabase()
 
     # AI_ENABLED is already False in conftest.py — no patching needed.
     with patch("comm_layer.transcription.httpx.AsyncClient") as mock_httpx:
-        with patch("comm_layer.transcription.DeepgramClient") as mock_dg:
+        with patch("comm_layer.transcription.OpenAI") as mock_openai:
             await transcribe_recording(
                 supabase=mock_supabase,
                 call_event_id=FAKE_CALL_EVENT_ID,
@@ -90,9 +97,9 @@ async def test_transcription_skipped_when_ai_disabled():
                 recording_sid=FAKE_RECORDING_SID,
             )
 
-    # Neither httpx nor Deepgram should have been touched.
+    # Neither httpx nor OpenAI should have been touched.
     mock_httpx.assert_not_called()
-    mock_dg.assert_not_called()
+    mock_openai.assert_not_called()
     mock_execute.assert_not_called()
 
 
@@ -100,38 +107,33 @@ async def test_transcription_skipped_when_ai_disabled():
 async def test_transcription_happy_path():
     """
     With AI_ENABLED=True, a successful transcription downloads audio, calls
-    Deepgram, and inserts a row into the transcripts table with the transcript
+    Whisper, and inserts a row into the transcripts table with the transcript
     text and word-level segments.
     """
     mock_supabase, mock_execute, mock_table = make_mock_supabase()
-    deepgram_response = make_deepgram_response(
-        transcript="Hello world",
+    whisper_response = make_whisper_response(
+        text="Hello world",
         words=[
             {"word": "Hello", "start": 0.0, "end": 0.5},
             {"word": "world", "start": 0.6, "end": 1.0},
         ],
     )
-
-    mock_http_response = MagicMock()
-    mock_http_response.content = b"fake_audio_bytes"
-    mock_http_response.raise_for_status = MagicMock()
+    mock_http_client = make_mock_http_client()
 
     with patch("comm_layer.transcription.settings") as mock_settings:
         mock_settings.AI_ENABLED = True
         mock_settings.TWILIO_ACCOUNT_SID = "ACtest"
         mock_settings.TWILIO_AUTH_TOKEN = "token"
-        mock_settings.DEEPGRAM_API_KEY = "dg-fake"
+        mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("comm_layer.transcription.httpx.AsyncClient") as mock_httpx_cls:
-            mock_http_client = AsyncMock()
-            mock_http_client.get = AsyncMock(return_value=mock_http_response)
             mock_httpx_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http_client)
             mock_httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with patch("comm_layer.transcription.DeepgramClient") as mock_dg_cls:
-                mock_dg_instance = MagicMock()
-                mock_dg_instance.listen.v1.media.transcribe_file.return_value = deepgram_response
-                mock_dg_cls.return_value = mock_dg_instance
+            with patch("comm_layer.transcription.OpenAI") as mock_openai_cls:
+                mock_openai_instance = MagicMock()
+                mock_openai_instance.audio.transcriptions.create.return_value = whisper_response
+                mock_openai_cls.return_value = mock_openai_instance
 
                 await transcribe_recording(
                     supabase=mock_supabase,
@@ -140,12 +142,12 @@ async def test_transcription_happy_path():
                     recording_sid=FAKE_RECORDING_SID,
                 )
 
-    # Verify the audio was downloaded from the right URL (with .mp3 appended)
+    # Audio was downloaded from the right URL (with .mp3 appended)
     mock_http_client.get.assert_called_once()
     called_url = mock_http_client.get.call_args[0][0]
     assert called_url == FAKE_RECORDING_URL + ".mp3"
 
-    # Verify the transcript was inserted
+    # Transcript was inserted with correct values
     mock_execute.assert_called_once()
     inserted = mock_table.insert.call_args[0][0]
     assert inserted["comm_event_id"] == str(FAKE_CALL_EVENT_ID)
@@ -162,38 +164,32 @@ async def test_transcription_happy_path():
 @pytest.mark.asyncio
 async def test_transcription_exception_is_logged_not_raised():
     """
-    If Deepgram raises an exception, transcribe_recording logs it and returns
+    If Whisper raises an exception, transcribe_recording logs it and returns
     cleanly — it must NOT propagate the exception. An uncaught exception in a
     detached asyncio.Task is effectively swallowed by the event loop, but we
     log it explicitly so failures appear in structured logs and monitoring.
     """
     mock_supabase, mock_execute, _ = make_mock_supabase()
-
-    mock_http_response = MagicMock()
-    mock_http_response.content = b"fake_audio_bytes"
-    mock_http_response.raise_for_status = MagicMock()
+    mock_http_client = make_mock_http_client()
 
     with patch("comm_layer.transcription.settings") as mock_settings:
         mock_settings.AI_ENABLED = True
         mock_settings.TWILIO_ACCOUNT_SID = "ACtest"
         mock_settings.TWILIO_AUTH_TOKEN = "token"
-        mock_settings.DEEPGRAM_API_KEY = "dg-fake"
+        mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("comm_layer.transcription.httpx.AsyncClient") as mock_httpx_cls:
-            mock_http_client = AsyncMock()
-            mock_http_client.get = AsyncMock(return_value=mock_http_response)
             mock_httpx_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http_client)
             mock_httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with patch("comm_layer.transcription.DeepgramClient") as mock_dg_cls:
-                mock_dg_instance = MagicMock()
-                # Deepgram raises — simulates API failure, network timeout, etc.
-                mock_dg_instance.listen.v1.media.transcribe_file.side_effect = RuntimeError(
-                    "Deepgram API error"
+            with patch("comm_layer.transcription.OpenAI") as mock_openai_cls:
+                mock_openai_instance = MagicMock()
+                mock_openai_instance.audio.transcriptions.create.side_effect = RuntimeError(
+                    "Whisper API error"
                 )
-                mock_dg_cls.return_value = mock_dg_instance
+                mock_openai_cls.return_value = mock_openai_instance
 
-                # Must NOT raise — exception absorbed inside transcribe_recording
+                # Must NOT raise — exception is absorbed inside transcribe_recording
                 await transcribe_recording(
                     supabase=mock_supabase,
                     call_event_id=FAKE_CALL_EVENT_ID,
@@ -201,43 +197,36 @@ async def test_transcription_exception_is_logged_not_raised():
                     recording_sid=FAKE_RECORDING_SID,
                 )
 
-    # Supabase insert should not have been called if Deepgram failed
+    # Supabase insert should not have been called if Whisper failed
     mock_execute.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_transcription_empty_deepgram_response_writes_null_text():
+async def test_transcription_empty_whisper_response_writes_null_text():
     """
-    When Deepgram returns no channels (e.g. completely silent audio), we write
-    a transcript row with null text and empty segments. This ensures the row
-    still exists so Phase 7 enrichment knows a transcription was attempted —
-    it won't re-trigger for the same recording.
+    When Whisper returns empty text and no words (e.g. completely silent audio),
+    we write a transcript row with null text and empty segments. This ensures
+    the row still exists so Phase 7 enrichment knows transcription was attempted
+    — it won't re-trigger for the same recording.
     """
     mock_supabase, mock_execute, mock_table = make_mock_supabase()
-
-    # Deepgram response with empty channels list
-    empty_response = SimpleNamespace(results=SimpleNamespace(channels=[]))
-
-    mock_http_response = MagicMock()
-    mock_http_response.content = b"silent_audio"
-    mock_http_response.raise_for_status = MagicMock()
+    empty_response = SimpleNamespace(text=None, words=[])
+    mock_http_client = make_mock_http_client(b"silent_audio")
 
     with patch("comm_layer.transcription.settings") as mock_settings:
         mock_settings.AI_ENABLED = True
         mock_settings.TWILIO_ACCOUNT_SID = "ACtest"
         mock_settings.TWILIO_AUTH_TOKEN = "token"
-        mock_settings.DEEPGRAM_API_KEY = "dg-fake"
+        mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("comm_layer.transcription.httpx.AsyncClient") as mock_httpx_cls:
-            mock_http_client = AsyncMock()
-            mock_http_client.get = AsyncMock(return_value=mock_http_response)
             mock_httpx_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http_client)
             mock_httpx_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            with patch("comm_layer.transcription.DeepgramClient") as mock_dg_cls:
-                mock_dg_instance = MagicMock()
-                mock_dg_instance.listen.v1.media.transcribe_file.return_value = empty_response
-                mock_dg_cls.return_value = mock_dg_instance
+            with patch("comm_layer.transcription.OpenAI") as mock_openai_cls:
+                mock_openai_instance = MagicMock()
+                mock_openai_instance.audio.transcriptions.create.return_value = empty_response
+                mock_openai_cls.return_value = mock_openai_instance
 
                 await transcribe_recording(
                     supabase=mock_supabase,

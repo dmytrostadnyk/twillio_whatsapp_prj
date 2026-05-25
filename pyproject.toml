@@ -20,9 +20,8 @@ dependencies = [
     # ── Telephony ──────────────────────────────────────────────────────────────
     "twilio>=9.3.0",
     # ── AI providers ───────────────────────────────────────────────────────────
-    "openai>=1.55.0",           # GPT-4o enrichment + embeddings
+    "openai>=1.55.0",           # GPT-4o enrichment + embeddings + Whisper transcription
     "cohere>=5.11.0",           # semantic search reranking
-    "deepgram-sdk>=3.7.0",      # real-time streaming STT
     # ── HTTP client (workers making outbound requests) ─────────────────────────
     "httpx>=0.28.0",
     # ── WebSocket support ──────────────────────────────────────────────────────
