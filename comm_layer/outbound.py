@@ -26,6 +26,18 @@ call to a thread so other coroutines keep running.
 WHY rate_limiter is keyword-only with a None default:
 Tests pass an explicit (full) bucket so they don't depend on the module-level
 singleton. Production callers omit it and get the shared default.
+
+CALLER RESPONSIBILITY — Twilio Client timeout:
+The twilio-python SDK's default HTTP client does not enforce a request timeout.
+A network partition between us and Twilio would hang the executor thread
+indefinitely. Construct the Client with an explicit timeout in production:
+
+    from twilio.rest import Client
+    from twilio.http.http_client import TwilioHttpClient
+    client = Client(sid, token, http_client=TwilioHttpClient(timeout=10.0))
+
+This module does NOT instantiate the Client (so we can stay testable), so the
+timeout is the caller's responsibility.
 """
 
 from __future__ import annotations
@@ -40,6 +52,27 @@ from comm_layer.config import settings
 from comm_layer.rate_limiter import RateLimitExceededError, TokenBucket  # noqa: F401 — re-export
 
 log = structlog.get_logger(__name__)
+
+# Webhook paths Twilio will POST to with status callbacks for messages/calls
+# we initiate. These must match the routes registered in comm_layer.webhooks.status.
+_SMS_STATUS_CALLBACK_PATH = "/webhooks/sms/status"
+_WHATSAPP_STATUS_CALLBACK_PATH = "/webhooks/whatsapp/status"
+_VOICE_STATUS_CALLBACK_PATH = "/webhooks/voice/status"
+
+
+def _status_callback_url(path: str) -> str:
+    """
+    Build a public status callback URL from settings.PUBLIC_BASE_URL.
+
+    WHY this exists:
+    Twilio only POSTs status callbacks when we tell it where to send them.
+    Without this parameter on the outbound API call, the entire status webhook
+    chain (queued → sent → delivered → failed) silently doesn't run for messages
+    we send. PUBLIC_BASE_URL is set per-environment (ngrok URL in dev, real
+    domain in prod) so this URL is always reachable from Twilio's network.
+    """
+    return f"{settings.PUBLIC_BASE_URL.rstrip('/')}{path}"
+
 
 # Shared rate limiter — all outbound calls (SMS, WhatsApp, Voice) draw from
 # the same bucket to ensure the total outbound rate stays within the configured limit.
@@ -114,6 +147,9 @@ async def send_sms(
             to=to,
             from_=settings.TWILIO_PHONE_NUMBER,
             body=body,
+            # Without status_callback, Twilio never POSTs delivery state updates
+            # to our /webhooks/sms/status handler. The entire status chain is lost.
+            status_callback=_status_callback_url(_SMS_STATUS_CALLBACK_PATH),
         ),
     )
     log.info("outbound.sms_sent", to=to, sid=msg.sid)
@@ -168,6 +204,7 @@ async def send_whatsapp(
             to=wa_to,
             from_=settings.TWILIO_WHATSAPP_NUMBER,
             body=actual_body,
+            status_callback=_status_callback_url(_WHATSAPP_STATUS_CALLBACK_PATH),
         ),
     )
     log.info(
@@ -206,6 +243,12 @@ async def initiate_call(
             to=to,
             from_=settings.TWILIO_PHONE_NUMBER,
             url=twiml_url,
+            status_callback=_status_callback_url(_VOICE_STATUS_CALLBACK_PATH),
+            # Only "completed" — the status webhook handler treats every callback
+            # as call.completed. Requesting more events (ringing/answered) without
+            # updating the handler would create duplicate event_keys that the
+            # idempotency constraint silently dedupes.
+            status_callback_event=["completed"],
         ),
     )
     log.info("outbound.call_initiated", to=to, sid=call.sid)

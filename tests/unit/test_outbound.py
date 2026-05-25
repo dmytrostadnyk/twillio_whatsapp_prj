@@ -37,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from comm_layer.config import settings
 from comm_layer.outbound import (
     WindowExpiredError,
     check_whatsapp_window,
@@ -174,8 +175,9 @@ async def test_send_sms_calls_twilio_with_correct_params():
     kwargs = client.messages.create.call_args.kwargs
     assert kwargs["to"] == "+15559876543"
     assert kwargs["body"] == "Hello!"
-    # from_ must be our Twilio number, not hardcoded
-    assert kwargs["from_"] is not None
+    # from_ must be our configured Twilio number — checking "not None" would
+    # silently accept any misconfiguration (e.g. WhatsApp number used for SMS).
+    assert kwargs["from_"] == settings.TWILIO_PHONE_NUMBER
 
 
 @pytest.mark.asyncio
@@ -186,6 +188,24 @@ async def test_send_sms_returns_message_sid():
     sid = await send_sms(client, to="+15559876543", body="Hi", rate_limiter=full_bucket())
 
     assert sid == "SM_expected"
+
+
+@pytest.mark.asyncio
+async def test_send_sms_includes_status_callback_url():
+    """
+    The status_callback parameter MUST be set so Twilio knows where to POST
+    delivery state changes. Without it, the entire SMS status callback chain
+    (queued → sent → delivered) silently never fires for outbound messages.
+    """
+    client = make_twilio_client()
+
+    await send_sms(client, to="+15559876543", body="Hi", rate_limiter=full_bucket())
+
+    kwargs = client.messages.create.call_args.kwargs
+    assert "status_callback" in kwargs
+    assert kwargs["status_callback"].endswith("/webhooks/sms/status")
+    # Must be a fully qualified URL Twilio can reach, not a relative path
+    assert kwargs["status_callback"].startswith("http")
 
 
 @pytest.mark.asyncio
@@ -212,7 +232,7 @@ async def test_send_whatsapp_uses_body_when_window_active():
         new=AsyncMock(return_value=True),
     ):
         await send_whatsapp(
-            client, pool=None, to="+15551234567", body="Hello!", rate_limiter=full_bucket()
+            client, pool=MagicMock(), to="+15551234567", body="Hello!", rate_limiter=full_bucket()
         )
 
     kwargs = client.messages.create.call_args.kwargs
@@ -230,7 +250,7 @@ async def test_send_whatsapp_uses_template_when_window_expired():
     ):
         await send_whatsapp(
             client,
-            pool=None,
+            pool=MagicMock(),
             to="+15551234567",
             body="This should NOT be sent",
             template_body="Pre-approved template message",
@@ -256,7 +276,11 @@ async def test_send_whatsapp_raises_when_window_expired_and_no_template():
     ):
         with pytest.raises(WindowExpiredError):
             await send_whatsapp(
-                client, pool=None, to="+15551234567", body="Hello!", rate_limiter=full_bucket()
+                client,
+                pool=MagicMock(),
+                to="+15551234567",
+                body="Hello!",
+                rate_limiter=full_bucket(),
             )
 
     client.messages.create.assert_not_called()
@@ -272,7 +296,7 @@ async def test_send_whatsapp_adds_prefix_to_plain_number():
         new=AsyncMock(return_value=True),
     ):
         await send_whatsapp(
-            client, pool=None, to="+15551234567", body="Hi", rate_limiter=full_bucket()
+            client, pool=MagicMock(), to="+15551234567", body="Hi", rate_limiter=full_bucket()
         )
 
     kwargs = client.messages.create.call_args.kwargs
@@ -290,7 +314,7 @@ async def test_send_whatsapp_preserves_existing_prefix():
     ):
         await send_whatsapp(
             client,
-            pool=None,
+            pool=MagicMock(),
             to="whatsapp:+15551234567",
             body="Hi",
             rate_limiter=full_bucket(),
@@ -298,6 +322,44 @@ async def test_send_whatsapp_preserves_existing_prefix():
 
     kwargs = client.messages.create.call_args.kwargs
     assert kwargs["to"] == "whatsapp:+15551234567"
+
+
+@pytest.mark.asyncio
+async def test_send_whatsapp_uses_configured_whatsapp_number_as_from():
+    """from_ must be the configured WhatsApp number, not the SMS number."""
+    client = make_twilio_client()
+
+    with patch(
+        "comm_layer.outbound.check_whatsapp_window",
+        new=AsyncMock(return_value=True),
+    ):
+        await send_whatsapp(
+            client, pool=MagicMock(), to="+15551234567", body="Hi", rate_limiter=full_bucket()
+        )
+
+    kwargs = client.messages.create.call_args.kwargs
+    assert kwargs["from_"] == settings.TWILIO_WHATSAPP_NUMBER
+
+
+@pytest.mark.asyncio
+async def test_send_whatsapp_includes_status_callback_url():
+    """
+    WhatsApp outbound must request status callbacks so we receive 'read'
+    receipts and delivery state transitions in /webhooks/whatsapp/status.
+    """
+    client = make_twilio_client()
+
+    with patch(
+        "comm_layer.outbound.check_whatsapp_window",
+        new=AsyncMock(return_value=True),
+    ):
+        await send_whatsapp(
+            client, pool=MagicMock(), to="+15551234567", body="Hi", rate_limiter=full_bucket()
+        )
+
+    kwargs = client.messages.create.call_args.kwargs
+    assert kwargs["status_callback"].endswith("/webhooks/whatsapp/status")
+    assert kwargs["status_callback"].startswith("http")
 
 
 @pytest.mark.asyncio
@@ -311,7 +373,7 @@ async def test_send_whatsapp_raises_when_rate_limited():
     ):
         with pytest.raises(RateLimitExceededError):
             await send_whatsapp(
-                client, pool=None, to="+15551234567", body="Hi", rate_limiter=empty_bucket()
+                client, pool=MagicMock(), to="+15551234567", body="Hi", rate_limiter=empty_bucket()
             )
 
     client.messages.create.assert_not_called()
@@ -336,7 +398,7 @@ async def test_initiate_call_calls_twilio_with_correct_params():
     kwargs = client.calls.create.call_args.kwargs
     assert kwargs["to"] == "+15559876543"
     assert kwargs["url"] == "https://example.com/twiml"
-    assert kwargs["from_"] is not None
+    assert kwargs["from_"] == settings.TWILIO_PHONE_NUMBER
 
 
 @pytest.mark.asyncio
@@ -352,6 +414,29 @@ async def test_initiate_call_returns_call_sid():
     )
 
     assert sid == "CA_expected"
+
+
+@pytest.mark.asyncio
+async def test_initiate_call_includes_status_callback_url_and_event():
+    """
+    Voice calls must request a status_callback URL so we get call.completed
+    events. We also request status_callback_event=["completed"] explicitly —
+    requesting more events (ringing/answered) would create event_keys that
+    collide with the handler's hardcoded :call.completed suffix.
+    """
+    client = make_twilio_client()
+
+    await initiate_call(
+        client,
+        to="+15559876543",
+        twiml_url="https://example.com/twiml",
+        rate_limiter=full_bucket(),
+    )
+
+    kwargs = client.calls.create.call_args.kwargs
+    assert kwargs["status_callback"].endswith("/webhooks/voice/status")
+    assert kwargs["status_callback"].startswith("http")
+    assert kwargs["status_callback_event"] == ["completed"]
 
 
 @pytest.mark.asyncio

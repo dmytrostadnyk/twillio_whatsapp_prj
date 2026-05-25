@@ -436,9 +436,8 @@ async def test_sms_status_callback_is_persisted(client):
     The event_key must embed the status so each transition is a unique row.
     """
     ac, mock_conn, mock_broker = client
-    import uuid as _uuid
 
-    event_id = _uuid.uuid4()
+    event_id = uuid.uuid4()
     mock_conn.fetchrow = AsyncMock(
         side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
     )
@@ -463,9 +462,8 @@ async def test_sms_status_event_key_includes_status(client):
     is not in the key, the second transition silently duplicates and is lost.
     """
     ac, mock_conn, _ = client
-    import uuid as _uuid
 
-    event_id = _uuid.uuid4()
+    event_id = uuid.uuid4()
     mock_conn.fetchrow = AsyncMock(
         side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
     )
@@ -495,9 +493,8 @@ async def test_whatsapp_status_callback_is_persisted(client):
     (which SMS doesn't have). These feed the dashboard's message status column.
     """
     ac, mock_conn, mock_broker = client
-    import uuid as _uuid
 
-    event_id = _uuid.uuid4()
+    event_id = uuid.uuid4()
     mock_conn.fetchrow = AsyncMock(
         side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
     )
@@ -517,9 +514,8 @@ async def test_whatsapp_status_callback_is_persisted(client):
 async def test_whatsapp_status_event_key_includes_status(client):
     """WhatsApp status event_key must include the status value."""
     ac, mock_conn, _ = client
-    import uuid as _uuid
 
-    event_id = _uuid.uuid4()
+    event_id = uuid.uuid4()
     mock_conn.fetchrow = AsyncMock(
         side_effect=make_fetchrow_handler(insert_returns={"id": event_id})
     )
