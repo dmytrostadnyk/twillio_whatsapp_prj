@@ -78,4 +78,4 @@ ignore_missing_imports = true   # external stubs often missing; tighten in prod
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=comm_layer --cov=delivery_worker --cov-report=term-missing"
+addopts = "--cov=comm_layer --cov=delivery_worker --cov=mock_azure_crm --cov-report=term-missing"

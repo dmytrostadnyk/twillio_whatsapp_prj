@@ -30,7 +30,6 @@ Or via Makefile:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request
@@ -51,10 +50,12 @@ def create_app() -> FastAPI:
     """
     _app = FastAPI(title="Mock Azure CRM", version="1.0.0")
 
-    # In-memory event store: event_key → {payload, received_at}
-    _app.state.events: dict[str, dict[str, Any]] = {}
+    # In-memory event store: event_key (str) → {"payload": dict, "received_at": str}
+    # NOTE: PEP 526 annotations on attribute targets (e.g. `app.state.x: dict = ...`)
+    # are discarded at runtime and invisible to type checkers, so we don't write them.
+    _app.state.events = {}
     # Chaos flag: when True all /events requests return 503
-    _app.state.down: bool = False
+    _app.state.down = False
 
     @_app.get("/health")
     async def health() -> JSONResponse:
@@ -78,14 +79,32 @@ def create_app() -> FastAPI:
                 status_code=503,
             )
 
+        # ValueError covers JSONDecodeError + UnicodeDecodeError (both subclasses).
+        # We deliberately do NOT catch bare Exception — that would hide programmer
+        # errors and make debugging crashes much harder.
         try:
-            payload: dict[str, Any] = await request.json()
-        except Exception:
+            payload = await request.json()
+        except ValueError:
             return JSONResponse({"error": "Request body must be valid JSON"}, status_code=400)
 
+        # JSON is more than dicts: arrays, scalars, null are all valid JSON. We need
+        # a top-level object — otherwise payload.get(...) would crash with 500.
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "Request body must be a JSON object (not an array or scalar)"},
+                status_code=400,
+            )
+
+        # event_key MUST be a non-empty string. Without this check, a client sending
+        # {"event_key": 12345} would store with an integer key — breaking idempotency
+        # if the same event later arrives with "12345" as a string. A dict/list would
+        # also crash on the unhashable `in` check below.
         event_key = payload.get("event_key")
-        if not event_key:
-            return JSONResponse({"error": "Missing required field: event_key"}, status_code=400)
+        if not isinstance(event_key, str) or not event_key.strip():
+            return JSONResponse(
+                {"error": "Missing or invalid event_key (must be a non-empty string)"},
+                status_code=400,
+            )
 
         schema_version = payload.get("schema_version")
         if schema_version != SUPPORTED_SCHEMA_VERSION:

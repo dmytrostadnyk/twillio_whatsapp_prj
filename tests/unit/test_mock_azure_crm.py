@@ -182,6 +182,52 @@ async def test_non_json_body_returns_400(client):
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "body",
+    [["a", "b"], "just a string", 42, 3.14, True],
+    ids=["array", "string", "int", "float", "bool"],
+)
+@pytest.mark.asyncio
+async def test_non_object_json_body_returns_400(client, body):
+    """
+    Valid JSON that isn't an object (arrays, scalars) must be rejected with 400
+    — not crash the route with AttributeError when we try payload.get(...).
+    """
+    async with client as c:
+        response = await c.post("/events", json=body)
+    assert response.status_code == 400
+    assert "object" in response.json()["error"].lower()
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [12345, ["a", "b"], {"nested": "dict"}, 3.14, True],
+    ids=["int", "list", "dict", "float", "bool"],
+)
+@pytest.mark.asyncio
+async def test_non_string_event_key_returns_400(client, bad_key):
+    """
+    event_key must be a string. A numeric key would be stored with the wrong
+    type and break idempotency on retry; a list/dict would crash on dict insert.
+    """
+    payload = make_contract()
+    payload["event_key"] = bad_key
+    async with client as c:
+        response = await c.post("/events", json=payload)
+    assert response.status_code == 400
+    assert "event_key" in response.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_event_key_returns_400(client):
+    """An event_key of '   ' is effectively empty — reject."""
+    payload = make_contract()
+    payload["event_key"] = "   "
+    async with client as c:
+        response = await c.post("/events", json=payload)
+    assert response.status_code == 400
+
+
 # ── /admin/toggle — chaos mode ─────────────────────────────────────────────────
 
 
@@ -229,6 +275,37 @@ async def test_toggle_does_not_store_events_made_during_downtime(client):
         await c.post("/admin/toggle")           # → UP
         response = await c.get("/admin/events")
     assert response.json()["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_events_still_works_during_chaos(client):
+    """
+    Even when chaos is ON, operators need to see what's in the store. The 503
+    must apply ONLY to /events — admin endpoints must remain reachable so the
+    dashboard keeps working during the demo.
+    """
+    async with client as c:
+        # Store something first
+        await c.post("/events", json=make_contract())
+        # Then go into chaos mode
+        await c.post("/admin/toggle")
+        # Admin endpoints must still respond
+        response = await c.get("/admin/events")
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_health_still_works_during_chaos(client):
+    """Health check must NOT report unhealthy just because chaos is on —
+    chaos is a synthetic flag, not actual process death."""
+    async with client as c:
+        await c.post("/admin/toggle")
+        response = await c.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["down"] is True
 
 
 # ── /admin/events ──────────────────────────────────────────────────────────────
