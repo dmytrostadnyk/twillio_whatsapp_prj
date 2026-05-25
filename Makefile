@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
-        db.reset db.migrate up down demo clean
+        db.reset db.migrate up down demo mock-crm worker clean
 
 # Print help by default
 help:
@@ -23,6 +23,8 @@ help:
 	@echo "  make db.migrate       Run any pending migrations"
 	@echo "  make up               Start all services with docker-compose"
 	@echo "  make down             Stop all services"
+	@echo "  make mock-crm         Start the mock Azure CRM on port 8001"
+	@echo "  make worker           Start the delivery worker"
 	@echo "  make demo             Run the chaos demo script"
 	@echo "  make clean            Remove caches and temp files"
 	@echo ""
@@ -77,6 +79,12 @@ up:
 
 down:
 	docker-compose down
+
+mock-crm:
+	uvicorn mock_azure_crm.main:app --host 0.0.0.0 --port 8001 --reload
+
+worker:
+	python delivery_worker/main.py
 
 demo:
 	@echo "Running chaos demo..."
