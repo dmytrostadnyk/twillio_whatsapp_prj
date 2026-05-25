@@ -31,6 +31,7 @@ status callback and arrives at /webhooks/voice/recording.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Annotated
 
@@ -38,11 +39,13 @@ import asyncpg
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
+from supabase import AsyncClient
 
 from comm_layer.broker.base import Broker
 from comm_layer.contracts.base import EventSource
-from comm_layer.deps import get_broker, get_pool
+from comm_layer.deps import get_broker, get_pool, get_supabase
 from comm_layer.number_registry import resolve_source
+from comm_layer.transcription import transcribe_recording
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
 from comm_layer.webhooks.responses import EMPTY_TWIML
@@ -60,7 +63,7 @@ async def lookup_call_context(
     """
     Fetch the originating call.started event by CallSid.
 
-    Returns a dict with correlation_id, direction, from_number, to_number,
+    Returns a dict with id, correlation_id, direction, from_number, to_number,
     and source — or None if no originating call exists (out-of-order webhook,
     or we received a recording for a call we never persisted).
 
@@ -83,7 +86,7 @@ async def lookup_call_context(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT correlation_id, direction, from_number, to_number, source_metadata
+            SELECT id, correlation_id, direction, from_number, to_number, source_metadata
             FROM comm_events
             WHERE event_type = 'call.started'
               AND raw_payload->>'CallSid' = $1
@@ -94,6 +97,7 @@ async def lookup_call_context(
     if row is None:
         return None
     return {
+        "id": row["id"],
         "correlation_id": row["correlation_id"],
         "direction": row["direction"],
         "from_number": row["from_number"],
@@ -233,6 +237,7 @@ async def voice_recording_ready(
     form: Annotated[dict[str, str], Depends(require_twilio_signature)],
     pool: Annotated[asyncpg.Pool, Depends(get_pool)],
     broker: Annotated[Broker, Depends(get_broker)],
+    supabase: Annotated[AsyncClient, Depends(get_supabase)],
 ) -> Response:
     """
     Recording-ready callback — fires when Twilio finishes encoding a recording.
@@ -329,5 +334,19 @@ async def voice_recording_ready(
         raw_payload=dict(form),
         correlation_id=correlation_id,
     )
+
+    # Fire batch transcription as a background task so the webhook returns
+    # immediately (fast-ack). Only triggered for completed recordings when we
+    # have a call_event_id to link the transcript to via FK. If call_ctx is
+    # None (fallback path), we skip transcription rather than violate the FK.
+    if recording_status == "completed" and call_ctx is not None:
+        asyncio.create_task(
+            transcribe_recording(
+                supabase=supabase,
+                call_event_id=call_ctx["id"],
+                recording_url=form.get("RecordingUrl", ""),
+                recording_sid=recording_sid,
+            )
+        )
 
     return Response(content=EMPTY_TWIML, media_type="application/xml")

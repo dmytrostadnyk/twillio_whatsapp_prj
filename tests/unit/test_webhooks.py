@@ -105,6 +105,7 @@ async def client(mock_asyncpg_pool):
 
     mock_broker = AsyncMock()
     mock_broker.publish = AsyncMock(return_value=None)
+    mock_supabase = AsyncMock()
 
     # Default: registry returns nothing (unknown number), INSERT succeeds (new event).
     event_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -113,11 +114,12 @@ async def client(mock_asyncpg_pool):
     )
     mock_conn.fetchval = AsyncMock(return_value=1)  # for health check
 
-    from comm_layer.deps import get_broker, get_pool
+    from comm_layer.deps import get_broker, get_pool, get_supabase
     from comm_layer.main import app
 
     app.dependency_overrides[get_pool] = lambda: mock_pool
     app.dependency_overrides[get_broker] = lambda: mock_broker
+    app.dependency_overrides[get_supabase] = lambda: mock_supabase
 
     with (
         patch("comm_layer.main.create_pool", AsyncMock(return_value=mock_pool)),
@@ -745,6 +747,7 @@ async def test_recording_ready_inherits_context_from_call_started(client):
     ac, mock_conn, _ = client
 
     original_cid = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    original_call_event_id = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
     original_source_metadata = {
         "number": "+15551234567",
         "source_type": "campaign",
@@ -754,6 +757,7 @@ async def test_recording_ready_inherits_context_from_call_started(client):
         "metadata": {},
     }
     call_context = {
+        "id": original_call_event_id,
         "correlation_id": original_cid,
         "direction": "outbound",
         "from_number": "+15551234567",
