@@ -132,20 +132,23 @@ async def _worker(pool, supabase, worker_id: int) -> None:
             await asyncio.sleep(settings.DELIVERY_POLL_INTERVAL_SECONDS)
 
 
-async def run_consumer(pool, supabase) -> None:
+async def run_enrichment_consumer(pool, supabase) -> None:
     """
     Start ENRICHMENT_CONCURRENCY independent worker coroutines.
 
     WHY return_exceptions=True: if one worker raises an uncaught exception
     (beyond what _worker catches internally), we don't want it to cancel the
     other workers.  The exception is logged at the worker level.
+
+    Phase 8 note: this is now called `run_enrichment_consumer` (was `run_consumer`)
+    to distinguish it from `run_embedding_consumer` which runs in the same process.
     """
     workers = [
         _worker(pool, supabase, i)
         for i in range(settings.ENRICHMENT_CONCURRENCY)
     ]
     log.info(
-        "consumer.starting",
+        "enrichment_consumer.starting",
         concurrency=settings.ENRICHMENT_CONCURRENCY,
     )
     await asyncio.gather(*workers, return_exceptions=True)

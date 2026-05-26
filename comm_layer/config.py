@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     ENRICHMENT_CONCURRENCY: int = 3
     OUTBOUND_RATE_LIMIT_PER_MINUTE: int = 5
 
+    # ── Embeddings + semantic search (Phase 8) ──────────────────────────────────
+    # Number of concurrent embedding workers (background consumer). Each worker
+    # holds an open OpenAI HTTP connection while embedding — 3 is well under
+    # the default text-embedding-3-small rate limits.
+    EMBEDDING_CONCURRENCY: int = 3
+    # OpenAI model used at BOTH index time and query time. They MUST match —
+    # mixing models produces meaningless cosine distances.
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    # Cohere reranker model. v3.0 is English-tuned; for multilingual use the
+    # multilingual variant.
+    RERANK_MODEL: str = "rerank-english-v3.0"
+    # How many candidates we pull from pgvector before reranking. Bigger pool
+    # = better Cohere rerank quality, but a small Cohere bill per query.
+    SEARCH_CANDIDATE_POOL: int = 20
+    # Default page size returned to the caller after reranking.
+    SEARCH_DEFAULT_LIMIT: int = 10
+
     # ── Application ─────────────────────────────────────────────────────────────
     LOG_LEVEL: str = Field("INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     PUBLIC_BASE_URL: str = "https://localhost"

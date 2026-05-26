@@ -1,5 +1,5 @@
 """
-Intelligence Layer entry point — AI enrichment consumer.
+Intelligence Layer entry point — AI enrichment + embedding consumers.
 
 Run with:
     python -m intelligence_layer.main
@@ -8,15 +8,17 @@ Or via Makefile:
     make intelligence
 
 This is a long-running process, separate from the FastAPI webhook server and
-the delivery worker. It has one job: claim unenriched comm_events and enrich
-them with GPT-4o structured output.
+the delivery worker. It runs TWO consumer pipelines side by side:
+  1. Enrichment consumer (Phase 7) — calls GPT-4o for summary/intent/sentiment.
+  2. Embedding consumer (Phase 8) — calls OpenAI embeddings for semantic search.
 
 Reliability model:
-- Each worker goroutine catches its own exceptions so one crash does not
-  kill the others (see consumer._worker).
-- If a worker is SIGKILLed between claiming and completing, the enrichments
-  row stays at status='processing'. There is no automatic stale-row reaper
-  at this scope — acceptable for portfolio use, but noted as a known limitation.
+- Both consumers run under one asyncio.gather(return_exceptions=True) so a
+  failure inside one pipeline does NOT kill the other. Each consumer in turn
+  isolates per-worker exceptions internally.
+- If a worker is SIGKILLed between claiming and completing, the corresponding
+  status field stays at 'processing'. No automatic stale-row reaper at this
+  scope — acceptable for portfolio use, but noted as a known limitation.
 - AI kill switch: if AI_ENABLED=False, workers sleep without calling any AI
   provider. Flip the env var to resume without restarting the process.
 """
@@ -32,21 +34,33 @@ import structlog
 from comm_layer.config import settings
 from comm_layer.db import create_pool, create_supabase_client
 from comm_layer.logging_config import configure_logging
-from intelligence_layer.consumer import run_consumer
+from intelligence_layer.consumer import run_enrichment_consumer
+from intelligence_layer.embedding import run_embedding_consumer
 
 log = structlog.get_logger(__name__)
 
 
 async def main() -> None:
-    """Start up the intelligence consumer: create pool, supabase client, run loop."""
+    """Start up both intelligence consumers: pool, supabase, run both loops."""
     configure_logging(settings.LOG_LEVEL)
-    log.info("intelligence_layer.initialising", concurrency=settings.ENRICHMENT_CONCURRENCY)
+    log.info(
+        "intelligence_layer.initialising",
+        enrichment_concurrency=settings.ENRICHMENT_CONCURRENCY,
+        embedding_concurrency=settings.EMBEDDING_CONCURRENCY,
+    )
 
     pool = await create_pool()
     supabase = create_supabase_client()
 
     try:
-        await run_consumer(pool, supabase)
+        # return_exceptions=True so one consumer crashing doesn't take down the
+        # other. The per-worker try/except inside each consumer already keeps
+        # individual failures from escaping; this is belt-and-braces.
+        await asyncio.gather(
+            run_enrichment_consumer(pool, supabase),
+            run_embedding_consumer(pool),
+            return_exceptions=True,
+        )
     finally:
         await pool.close()
         log.info("intelligence_layer.stopped")
