@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
-        db.reset db.migrate up down demo mock-crm worker clean
+        db.reset db.migrate up down demo mock-crm worker intel dashboard clean
 
 # Print help by default
 help:
@@ -25,6 +25,8 @@ help:
 	@echo "  make down             Stop all services"
 	@echo "  make mock-crm         Start the mock Azure CRM on port 8001"
 	@echo "  make worker           Start the delivery worker"
+	@echo "  make intel            Start the intelligence layer (enrichment + embedding)"
+	@echo "  make dashboard        Start the Streamlit operator dashboard"
 	@echo "  make demo             Run the chaos demo script"
 	@echo "  make clean            Remove caches and temp files"
 	@echo ""
@@ -85,6 +87,12 @@ mock-crm:
 
 worker:
 	python delivery_worker/main.py
+
+intel:
+	python -m intelligence_layer.main
+
+dashboard:
+	streamlit run dashboard/main.py
 
 demo:
 	@echo "Running chaos demo..."

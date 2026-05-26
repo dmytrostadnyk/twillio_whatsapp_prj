@@ -78,3 +78,6 @@ ignore_missing_imports = true   # external stubs often missing; tighten in prod
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=comm_layer --cov=delivery_worker --cov=mock_azure_crm --cov-report=term-missing"
+markers = [
+    "integration: tests that require a real database and live env vars; require DATABASE_URL and INTEGRATION_TEST_CONFIRMED=1",
+]
