@@ -50,7 +50,7 @@ async def main() -> None:
     )
 
     pool = await create_pool()
-    supabase = create_supabase_client()
+    supabase = await create_supabase_client()
 
     try:
         # return_exceptions=True so one consumer crashing doesn't take down the

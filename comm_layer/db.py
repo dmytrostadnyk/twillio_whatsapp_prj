@@ -70,6 +70,7 @@ async def create_pool() -> asyncpg.Pool:
         max_size=10,
         command_timeout=30,    # raise an error if a single query takes > 30s
         init=_init_connection,
+        statement_cache_size=0,  # required when connecting through Supabase pooler
     )
     log.info("db.pool_created", min_size=2, max_size=10)
     return pool

@@ -3,6 +3,7 @@
 #  Usage: make <target>
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 .PHONY: help install install-dev lint format typecheck test test-unit test-integration \
         db.reset db.migrate up down demo mock-crm worker intel dashboard clean
 
@@ -62,7 +63,7 @@ test-integration:
 # Apply all SQL migrations in numbered order
 db.migrate:
 	@echo "Applying migrations..."
-	@for f in migrations/*.sql; do \
+	@set -a; . ./.env; set +a; for f in migrations/*.sql; do \
 		echo "  → $$f"; \
 		psql "$$DATABASE_URL" -f "$$f"; \
 	done

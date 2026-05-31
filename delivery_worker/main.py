@@ -29,6 +29,7 @@ import asyncio
 import random
 import signal
 import sys
+import time
 
 import httpx
 import structlog
@@ -91,6 +92,38 @@ def parse_retry_after(response: httpx.Response) -> float | None:
         return None
 
 
+# ── Delivery log ───────────────────────────────────────────────────────────────
+
+
+async def _write_delivery_log(
+    pool,
+    comm_event_id,
+    correlation_id,
+    attempt_number: int,
+    status: str,
+    http_status: int | None = None,
+    latency_ms: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Insert one row into delivery_log for every delivery attempt (pass or fail)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO delivery_log (
+                comm_event_id, correlation_id, attempt_number,
+                status, http_status, latency_ms, error_message
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            comm_event_id,
+            correlation_id,
+            attempt_number,
+            status,
+            http_status,
+            latency_ms,
+            error_message,
+        )
+
+
 # ── Per-message processing ─────────────────────────────────────────────────────
 
 
@@ -98,6 +131,7 @@ async def process_message(
     broker: PostgresBroker,
     http_client: httpx.AsyncClient,
     msg: BrokerMessage,
+    pool,
 ) -> None:
     """
     Deliver one event to Azure CRM. Outcomes:
@@ -124,6 +158,10 @@ async def process_message(
             msg.id,
             f"Exceeded maximum delivery attempts ({settings.DELIVERY_MAX_ATTEMPTS})",
         )
+        await _write_delivery_log(
+            pool, msg.id, msg.correlation_id, msg.attempt_count,
+            status="failure", error_message="max_attempts_exceeded",
+        )
         log.error("delivery.max_attempts_exceeded", event_key=msg.event_key)
         return
 
@@ -133,6 +171,7 @@ async def process_message(
         "X-Event-Key": msg.event_key,
     }
 
+    t0 = time.monotonic()
     try:
         response = await http_client.post(
             f"{settings.AZURE_CRM_URL}/events",
@@ -143,15 +182,26 @@ async def process_message(
     except httpx.RequestError as exc:
         # Covers TimeoutException, ConnectError, ReadError, WriteError, PoolTimeout,
         # NetworkError — any I/O failure during the request. All retryable.
+        latency_ms = int((time.monotonic() - t0) * 1000)
         backoff = compute_backoff(msg.attempt_count)
         error_type = type(exc).__name__
         await broker.nack(msg.id, f"{error_type}: {exc}", backoff)
+        await _write_delivery_log(
+            pool, msg.id, msg.correlation_id, msg.attempt_count,
+            status="failure", latency_ms=latency_ms, error_message=f"{error_type}: {exc}",
+        )
         log.warning("delivery.network_error_retry", error_type=error_type, backoff_seconds=backoff)
         return
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
 
     if response.status_code < 400:
         # Success — record the exact contract we shipped for auditability
         await broker.ack(msg.id, contract_payload=contract)
+        await _write_delivery_log(
+            pool, msg.id, msg.correlation_id, msg.attempt_count,
+            status="success", http_status=response.status_code, latency_ms=latency_ms,
+        )
         log.info("delivery.success", http_status=response.status_code)
         return
 
@@ -160,6 +210,11 @@ async def process_message(
         # Real client error — retrying the same payload won't help
         reason = f"HTTP {response.status_code}: {response.text[:300]}"
         await broker.dead_letter(msg.id, reason)
+        await _write_delivery_log(
+            pool, msg.id, msg.correlation_id, msg.attempt_count,
+            status="failure", http_status=response.status_code,
+            latency_ms=latency_ms, error_message=reason,
+        )
         log.error("delivery.dead_lettered_4xx", http_status=response.status_code, reason=reason)
         return
 
@@ -169,6 +224,11 @@ async def process_message(
     backoff = retry_after if retry_after is not None else compute_backoff(msg.attempt_count)
     reason = f"HTTP {response.status_code}: {response.text[:300]}"
     await broker.nack(msg.id, reason, backoff)
+    await _write_delivery_log(
+        pool, msg.id, msg.correlation_id, msg.attempt_count,
+        status="failure", http_status=response.status_code,
+        latency_ms=latency_ms, error_message=reason,
+    )
     log.warning(
         "delivery.retry_scheduled",
         http_status=response.status_code,
@@ -180,7 +240,7 @@ async def process_message(
 # ── Poll loop ──────────────────────────────────────────────────────────────────
 
 
-async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient) -> None:
+async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient, pool) -> None:
     """
     Main poll loop. Runs forever until a shutdown signal is received.
 
@@ -204,7 +264,7 @@ async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient) -> 
             if msg is None:
                 await asyncio.sleep(settings.DELIVERY_POLL_INTERVAL_SECONDS)
                 continue
-            await process_message(broker, http_client, msg)
+            await process_message(broker, http_client, msg, pool)
 
         except asyncio.CancelledError:
             # Clean shutdown — let the finally block in main() close resources
@@ -233,7 +293,7 @@ async def main() -> None:
     # efficient than creating a new connection for every event.
     async with httpx.AsyncClient() as http_client:
         try:
-            await run_worker(broker, http_client)
+            await run_worker(broker, http_client, pool)
         finally:
             await pool.close()
             log.info("delivery_worker.stopped")
