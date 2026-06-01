@@ -28,20 +28,34 @@ from intelligence_layer.enrichment import enrich_event
 log = structlog.get_logger()
 
 # SQL that atomically picks the next unenriched event and inserts the claim row.
+#
+# WHY two transcript CTEs:
+# SMS/WhatsApp transcripts are linked directly to the event (comm_event_id = ce.id).
+# Voice transcripts are saved against the call.started event, NOT recording.ready,
+# because that is the event whose ID the transcription background task receives.
+# Both call.started and recording.ready share the same correlation_id, so we use
+# that to bridge from recording.ready → call.started → transcript.
 _CLAIM_QUERY = """\
 WITH latest_transcript AS (
     SELECT DISTINCT ON (comm_event_id) comm_event_id, text
     FROM transcripts
     ORDER BY comm_event_id, created_at DESC
+),
+voice_transcript AS (
+    SELECT cs.correlation_id, lt.text
+    FROM comm_events cs
+    JOIN latest_transcript lt ON lt.comm_event_id = cs.id
+    WHERE cs.event_type = 'call.started'
 )
 SELECT ce.id, ce.event_type, ce.raw_payload, ce.correlation_id,
-       lt.text AS transcript_text
+       COALESCE(lt.text, vt.text) AS transcript_text
 FROM comm_events ce
 LEFT JOIN latest_transcript lt ON lt.comm_event_id = ce.id
+LEFT JOIN voice_transcript vt ON vt.correlation_id = ce.correlation_id
 LEFT JOIN enrichments e ON e.comm_event_id = ce.id
 WHERE ce.event_type IN ('sms.received', 'whatsapp.received', 'recording.ready')
   AND e.id IS NULL
-  AND (ce.event_type != 'recording.ready' OR lt.text IS NOT NULL)
+  AND (ce.event_type != 'recording.ready' OR vt.text IS NOT NULL)
 ORDER BY ce.created_at
 LIMIT 1
 FOR UPDATE OF ce SKIP LOCKED;
