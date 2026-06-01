@@ -156,7 +156,7 @@ def main() -> None:
     parser.add_argument(
         "--audio",
         default="tests/fixtures/sample_call.mp3",
-        help="Path to the MP3 audio file to use as the recording (default: tests/fixtures/sample_call.mp3)",
+        help="Path to MP3 recording (default: tests/fixtures/sample_call.mp3)",
     )
     args = parser.parse_args()
 

@@ -18,15 +18,6 @@ Deploy ONLY behind a VPN or authenticated reverse proxy. Never expose port 8501
 to the public internet.
 """
 
-import os
-import pathlib
-
-# Streamlit changes CWD to the directory containing this script (dashboard/).
-# comm_layer/config.py looks for .env relative to CWD, so it would fail to find
-# the project root .env. Restore CWD to the project root before any imports
-# that trigger settings loading.
-os.chdir(pathlib.Path(__file__).parent.parent)
-
 import streamlit as st
 
 from dashboard.views import delivery, feed, search, stats

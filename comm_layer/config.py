@@ -13,16 +13,21 @@ Usage:
 """
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Absolute path to the project-root .env so settings load correctly regardless
+# of the process CWD (e.g. Streamlit changes CWD to the dashboard/ folder).
+_ENV_FILE = Path(__file__).parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     """All configuration is read from environment variables (or .env file in dev)."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",          # load .env in development
+        env_file=str(_ENV_FILE),  # load .env in development
         env_file_encoding="utf-8",
         case_sensitive=True,      # variable names are case-sensitive
         extra="ignore",           # ignore unknown env vars (other services may set extras)
