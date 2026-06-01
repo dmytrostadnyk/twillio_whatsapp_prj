@@ -78,6 +78,16 @@ def make_broker() -> AsyncMock:
     return broker
 
 
+def make_pool():
+    """Mock asyncpg pool so _write_delivery_log doesn't need a real DB."""
+    from unittest.mock import MagicMock
+    conn = AsyncMock()
+    pool = MagicMock()
+    pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+    pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+    return pool
+
+
 # ── process_message — happy path ───────────────────────────────────────────────
 
 
@@ -89,7 +99,7 @@ async def test_successful_delivery_calls_ack():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.ack.assert_called_once()
     call_kwargs = broker.ack.call_args.kwargs
@@ -105,7 +115,7 @@ async def test_successful_delivery_does_not_call_nack_or_dead_letter():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_not_called()
     broker.dead_letter.assert_not_called()
@@ -124,7 +134,7 @@ async def test_outbound_request_carries_tracing_headers():
     msg = make_message()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, msg)
+        await process_message(broker, client, msg, make_pool())
 
     assert route.called
     request = route.calls[0].request
@@ -149,7 +159,7 @@ async def test_azure_500_calls_nack_with_body_in_reason():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
@@ -166,7 +176,7 @@ async def test_azure_503_calls_nack():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
@@ -187,7 +197,7 @@ async def test_azure_422_dead_letters_immediately():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.dead_letter.assert_called_once()
     broker.nack.assert_not_called()
@@ -202,7 +212,7 @@ async def test_azure_400_dead_letters_immediately():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.dead_letter.assert_called_once()
     broker.nack.assert_not_called()
@@ -221,7 +231,7 @@ async def test_transient_4xx_retries_instead_of_dead_lettering(status_code):
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
@@ -245,7 +255,7 @@ async def test_retry_after_header_overrides_computed_backoff():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     backoff_arg = broker.nack.call_args.args[2]
@@ -260,7 +270,7 @@ async def test_missing_retry_after_falls_back_to_computed_backoff():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     backoff_arg = broker.nack.call_args.args[2]
@@ -278,7 +288,7 @@ async def test_http_timeout_calls_nack():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
@@ -294,7 +304,7 @@ async def test_http_connect_error_calls_nack():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
@@ -314,7 +324,7 @@ async def test_other_httpx_request_errors_also_nack():
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message())
+        await process_message(broker, client, make_message(), make_pool())
 
     broker.nack.assert_called_once()
     reason_arg = broker.nack.call_args.args[1]
@@ -336,7 +346,7 @@ async def test_max_attempts_dead_letters_before_http_call():
     msg = make_message(attempt_count=settings.DELIVERY_MAX_ATTEMPTS + 1)
 
     async with httpx.AsyncClient() as client:
-        await process_message(broker, client, msg)
+        await process_message(broker, client, msg, make_pool())
 
     broker.dead_letter.assert_called_once()
     assert not respx.calls.called
