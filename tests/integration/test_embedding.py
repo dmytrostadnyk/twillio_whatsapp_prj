@@ -13,7 +13,6 @@ Mixing enrichment + embedding in one test would conflate two failure modes.
 
 from __future__ import annotations
 
-import json
 import uuid
 
 import pytest

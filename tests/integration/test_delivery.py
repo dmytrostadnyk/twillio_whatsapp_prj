@@ -13,7 +13,6 @@ the delivery logic without the polling machinery.
 
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import UTC, datetime
 

@@ -13,7 +13,6 @@ triggering the delivery worker's claim at the same time.
 
 from __future__ import annotations
 
-import json
 import uuid
 
 import pytest

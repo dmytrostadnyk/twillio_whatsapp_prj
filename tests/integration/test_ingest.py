@@ -13,8 +13,8 @@ without the overhead of starting a real server. The DB writes are real.
 
 from __future__ import annotations
 
-import pytest
 import httpx
+import pytest
 from httpx import ASGITransport
 from twilio.request_validator import RequestValidator
 
