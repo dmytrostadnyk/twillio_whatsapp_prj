@@ -1,14 +1,21 @@
 """
-Integration test — Case 2: claim → mock Azure CRM → delivered.
+Integration test — HubSpot delivery: enriched event → contact updated.
 
-Inserts a comm_events row directly, uses respx to stub the Azure CRM HTTP
-endpoint, calls process_message() once, and asserts the row is marked
-'delivered' with a contract_payload.
+Seeds a comm_events row (delivery_status='pending') and a terminal enrichments
+row, then calls process_message() with mocked HubSpot endpoints and asserts:
+- The comm_events row is marked 'delivered'
+- hubspot_contact_id is persisted on the row
+- A delivery_log success row is written
 
 WHY we call process_message() directly instead of running the poll loop:
 The poll loop adds timing dependencies (sleep intervals, lease expiry) that
 make tests slow and flaky. Calling the per-message processor directly proves
 the delivery logic without the polling machinery.
+
+WHY we seed an enrichments row:
+claim_next() now gates on enrichments.status IN ('completed','failed','skipped').
+Without a terminal enrichments row the event is invisible to the delivery worker
+and process_message can't be demonstrated end-to-end via the DB-backed broker.
 """
 
 from __future__ import annotations
@@ -27,9 +34,23 @@ from delivery_worker.main import process_message
 
 pytestmark = pytest.mark.integration
 
+_SEARCH_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search"
+_CREATE_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts"
+_PATCH_URL_PREFIX = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/"
 
-async def _insert_pending_event(conn, event_key: str) -> uuid.UUID:
-    """Insert a minimal comm_events row in 'pending' state. Returns the UUID."""
+_FOUND_CONTACT = {
+    "results": [
+        {"id": "hs-contact-999", "properties": {"phone": "+15550000001", "ai_comm_log": ""}}
+    ]
+}
+
+
+async def _insert_pending_event_with_enrichment(conn, event_key: str) -> uuid.UUID:
+    """
+    Insert a comm_events row in 'pending' state and a terminal enrichments row.
+
+    Returns the comm_events UUID.
+    """
     row = await conn.fetchrow(
         """
         INSERT INTO comm_events (
@@ -51,20 +72,35 @@ async def _insert_pending_event(conn, event_key: str) -> uuid.UUID:
         settings.TWILIO_PHONE_NUMBER,
         uuid.uuid4(),
     )
-    return row["id"]
+    event_id = row["id"]
+
+    # Insert a terminal enrichments row so claim_next() can see this event.
+    await conn.execute(
+        """
+        INSERT INTO enrichments (comm_event_id, status, model, schema_version,
+                                  summary, intent, sentiment)
+        VALUES ($1, 'completed', 'gpt-4o', '1.0',
+                'Test summary.', 'general_query', 'neutral')
+        ON CONFLICT (comm_event_id) DO NOTHING
+        """,
+        event_id,
+    )
+    return event_id
 
 
 @pytest.mark.asyncio
-async def test_delivery_worker_delivers_event(pool, test_prefix):
+async def test_delivery_marks_event_delivered_and_persists_contact_id(pool, test_prefix):
     """
-    Given a 'pending' comm_events row and a CRM stub that returns 200,
-    process_message() should mark the row as 'delivered' with a non-null
-    contract_payload.
+    End-to-end: pending event + enrichment → HubSpot mocked → row delivered.
+    Verifies that:
+    - delivery_status is updated to 'delivered'
+    - hubspot_contact_id is persisted on the comm_events row
+    - contract_payload (ack payload) is not null
     """
-    event_key = f"{test_prefix}SM-deliv-1:sms.received"
+    event_key = f"{test_prefix}SM-hubspot-1:sms.received"
 
     async with pool.acquire() as conn:
-        event_id = await _insert_pending_event(conn, event_key)
+        event_id = await _insert_pending_event_with_enrichment(conn, event_key)
 
     broker = PostgresBroker(pool)
     msg = BrokerMessage(
@@ -81,39 +117,49 @@ async def test_delivery_worker_delivers_event(pool, test_prefix):
         attempt_count=1,
         created_at=datetime.now(UTC),
         claimed_at=datetime.now(UTC),
+        summary="Test summary.",
+        intent="general_query",
+        sentiment="neutral",
+        entities=[],
+        action_items=[],
+        hubspot_contact_id=None,
     )
 
-    crm_url = f"{settings.AZURE_CRM_URL}/events"
-
     with respx.mock:
-        respx.post(crm_url).mock(return_value=httpx.Response(200))
+        respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT))
+        respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(
+            return_value=httpx.Response(200, json={})
+        )
         async with httpx.AsyncClient() as http_client:
-            await process_message(broker, http_client, msg)
+            await process_message(broker, http_client, msg, pool)
 
-    # Verify the DB row was updated
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT delivery_status, contract_payload FROM comm_events WHERE id = $1",
+            """
+            SELECT delivery_status, contract_payload, hubspot_contact_id
+            FROM comm_events WHERE id = $1
+            """,
             event_id,
         )
 
-    assert row is not None
     assert row["delivery_status"] == "delivered", (
         f"Expected 'delivered', got '{row['delivery_status']}'"
     )
     assert row["contract_payload"] is not None, "contract_payload should be written on success"
+    assert row["hubspot_contact_id"] == "hs-contact-999", (
+        f"Expected 'hs-contact-999', got '{row['hubspot_contact_id']}'"
+    )
 
 
 @pytest.mark.asyncio
-async def test_delivery_worker_nacks_on_5xx(pool, test_prefix):
+async def test_delivery_nacks_on_hubspot_5xx(pool, test_prefix):
     """
-    A 500 response from Azure CRM should nack the event (delivery_status='failed')
-    rather than dead-lettering it (attempt_count=1 is within the retry limit).
+    HubSpot 500 on contact search → event stays failed (nacked), not delivered.
     """
-    event_key = f"{test_prefix}SM-deliv-nack:sms.received"
+    event_key = f"{test_prefix}SM-hubspot-nack:sms.received"
 
     async with pool.acquire() as conn:
-        event_id = await _insert_pending_event(conn, event_key)
+        event_id = await _insert_pending_event_with_enrichment(conn, event_key)
 
     broker = PostgresBroker(pool)
     msg = BrokerMessage(
@@ -123,21 +169,25 @@ async def test_delivery_worker_nacks_on_5xx(pool, test_prefix):
         channel="sms",
         direction="inbound",
         event_type="sms.received",
-        from_number="+15550000003",
+        from_number="+15550000002",
         to_number=settings.TWILIO_PHONE_NUMBER,
         source_metadata={"is_unknown": True},
         raw_payload={"Body": "5xx test"},
         attempt_count=1,
         created_at=datetime.now(UTC),
         claimed_at=datetime.now(UTC),
+        summary="Test summary.",
+        intent="general_query",
+        sentiment="neutral",
+        entities=[],
+        action_items=[],
+        hubspot_contact_id=None,
     )
 
     with respx.mock:
-        respx.post(f"{settings.AZURE_CRM_URL}/events").mock(
-            return_value=httpx.Response(500)
-        )
+        respx.post(_SEARCH_URL).mock(return_value=httpx.Response(500))
         async with httpx.AsyncClient() as http_client:
-            await process_message(broker, http_client, msg)
+            await process_message(broker, http_client, msg, pool)
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(

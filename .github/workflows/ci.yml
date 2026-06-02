@@ -36,7 +36,7 @@ jobs:
           OPENAI_API_KEY: sk-fake
           COHERE_API_KEY: fake
           DEEPGRAM_API_KEY: fake
-          AZURE_CRM_URL: http://localhost:8001
+          HUBSPOT_PRIVATE_APP_TOKEN: pat-na1-fake-token-for-ci
           AI_ENABLED: "false"
           PUBLIC_BASE_URL: https://fake.ngrok-free.app
         run: pytest tests/unit -v --no-cov

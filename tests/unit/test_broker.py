@@ -57,6 +57,13 @@ def make_db_row(
         "raw_payload": {"Body": "Hello", "From": "+15559876543"},
         "attempt_count": attempt_count,
         "created_at": datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
+        # Enrichment fields (joined from enrichments table in the new claim_next)
+        "summary": "Test summary.",
+        "intent": "general_query",
+        "sentiment": "neutral",
+        "entities": [],
+        "action_items": [],
+        "hubspot_contact_id": None,
     }
 
 

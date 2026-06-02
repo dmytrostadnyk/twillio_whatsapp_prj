@@ -1,52 +1,60 @@
 """
-Contract payload builder for the delivery worker.
+HubSpot contact property builder for the delivery worker.
 
 WHY a separate module:
-Building the versioned contract is the only piece of logic in the delivery
-worker that isn't about queue mechanics. Keeping it separate makes it easy
-to test in isolation and easy to extend when new event types are added.
-
-The contract format is documented in CONTRACT.md. The shape here must match
-exactly — if you change the structure, bump schema_version and update CONTRACT.md.
+Building the set of properties to write is the only pure-logic piece in the
+delivery worker. Keeping it separate makes it easy to test in isolation without
+mocking any HTTP or DB calls.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 from comm_layer.broker.base import BrokerMessage
 
 
-def build_contract_payload(msg: BrokerMessage) -> dict[str, Any]:
+def build_hubspot_properties(msg: BrokerMessage, existing_log: str = "") -> dict[str, str]:
     """
-    Transform a claimed BrokerMessage into the versioned contract JSON
-    that will be POSTed to the Azure CRM endpoint.
+    Build the dict of HubSpot contact properties to write on delivery.
 
-    The contract separates normalised metadata (channel, direction, source)
-    from the raw Twilio payload so consumers don't have to parse Twilio-specific
-    fields themselves. Both are always present so consumers can choose.
+    The 'last_' fields always reflect the most recent event — HubSpot's contact
+    view shows them prominently and they are filterable (e.g. build a list of
+    all contacts whose last sentiment was 'frustrated').
 
-    Returns a plain dict — the caller (worker) serialises it to JSON when
-    building the HTTP request.
+    The 'ai_comm_log' field is a running, prepend-only history of every
+    AI-enriched communication. Prepending means the newest entry is always
+    at the top of the field when viewed in HubSpot.
+
+    WHY empty string instead of None for missing AI fields:
+    HubSpot's PATCH API ignores null values, but some property types reject them.
+    Empty string is always safe and renders cleanly in the HubSpot UI.
+
+    Known limitation: if process_message crashes between the PATCH and the ack,
+    a retry will append a second copy of this entry to the log. This is an
+    accepted trade-off for a single-worker deployment. The 'last_' fields are
+    always idempotent (same value overwritten).
     """
+    timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    # e.g. "Inbound SMS", "Inbound Voice", "Inbound WhatsApp"
+    channel_label = f"Inbound {msg.channel.title()}"
+
+    # Build the one-event block that will be prepended to the log.
+    lines = [f"[{timestamp} · {channel_label}]"]
+    if msg.summary:
+        lines.append(f"Summary: {msg.summary}")
+    if msg.intent:
+        lines.append(f"Intent: {msg.intent}")
+    if msg.sentiment:
+        lines.append(f"Sentiment: {msg.sentiment}")
+    if not (msg.summary or msg.intent or msg.sentiment):
+        lines.append("(AI enrichment unavailable for this event)")
+
+    new_entry = "\n".join(lines)
+    separator = "\n───\n"  # ─── visual divider between entries
+    updated_log = new_entry + (separator + existing_log if existing_log else "")
+
     return {
-        "schema_version": "1.0",
-        "event_key": msg.event_key,
-        "correlation_id": str(msg.correlation_id),
-        "channel": msg.channel,
-        "direction": msg.direction,
-        "event_type": msg.event_type,
-        # ISO-8601 UTC timestamp of when the event was first received
-        "timestamp": msg.created_at.isoformat(),
-        # Resolved at ingestion time from number_registry
-        "source": msg.source_metadata,
-        "data": {
-            # Normalised numbers from the comm_events columns (may be None for
-            # some status callbacks that don't carry From/To).
-            "from_number": msg.from_number,
-            "to_number": msg.to_number,
-            # Original Twilio form payload — consumers can extract any field
-            # not explicitly normalised above (e.g. Body, NumMedia, CallStatus).
-            "raw": msg.raw_payload,
-        },
+        "ai_last_intent": msg.intent or "",
+        "ai_last_sentiment": msg.sentiment or "",
+        "ai_last_summary": msg.summary or "",
+        "ai_comm_log": updated_log,
     }

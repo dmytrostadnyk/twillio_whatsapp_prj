@@ -458,9 +458,9 @@ async def test_whatsapp_valid_returns_200(client):
 @pytest.mark.asyncio
 async def test_sms_status_callback_is_persisted(client):
     """
-    SMS delivery status callbacks must be ingested as their own events so the
-    dashboard can show queued → sent → delivered progression.
-    The event_key must embed the status so each transition is a unique row.
+    SMS delivery status callbacks are persisted for audit (dashboard can show
+    queued → sent → delivered progression) but NOT queued for delivery to HubSpot.
+    Only sms.received, whatsapp.received, and recording.ready are deliverable.
     """
     ac, mock_conn, mock_broker = client
 
@@ -477,8 +477,8 @@ async def test_sms_status_callback_is_persisted(client):
     )
 
     assert response.status_code == 200
-    # Event should be queued for delivery
-    mock_broker.publish.assert_called_once()
+    # Status callbacks are persisted but NOT published to the delivery queue
+    mock_broker.publish.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -516,8 +516,9 @@ async def test_sms_status_event_key_includes_status(client):
 @pytest.mark.asyncio
 async def test_whatsapp_status_callback_is_persisted(client):
     """
-    WhatsApp status callbacks must be ingested — including 'read' receipts
-    (which SMS doesn't have). These feed the dashboard's message status column.
+    WhatsApp status callbacks (including 'read' receipts) are persisted for
+    audit but NOT queued for HubSpot delivery. Only whatsapp.received is
+    deliverable — status callbacks are never enriched so they must not be queued.
     """
     ac, mock_conn, mock_broker = client
 
@@ -534,7 +535,8 @@ async def test_whatsapp_status_callback_is_persisted(client):
     )
 
     assert response.status_code == 200
-    mock_broker.publish.assert_called_once()
+    # Status callbacks are persisted but NOT published to the delivery queue
+    mock_broker.publish.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -866,7 +868,9 @@ async def test_recording_failed_persisted_as_distinct_event(client):
     )
 
     assert response.status_code == 200
-    mock_broker.publish.assert_called_once()
+    # recording.failed is persisted for ops visibility but NOT published —
+    # only recording.ready (with a transcript) is deliverable to HubSpot.
+    mock_broker.publish.assert_not_called()
 
     insert_calls = [
         call for call in mock_conn.fetchrow.call_args_list

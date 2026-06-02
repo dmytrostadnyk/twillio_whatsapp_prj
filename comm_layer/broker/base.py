@@ -48,6 +48,15 @@ class BrokerMessage:
     attempt_count: int
     created_at: datetime
     claimed_at: datetime
+    # Enrichment fields — populated from the enrichments table when status is terminal.
+    # None means enrichment hasn't completed or AI was disabled for this event.
+    summary: str | None = None
+    intent: str | None = None
+    sentiment: str | None = None
+    entities: list | None = None
+    action_items: list | None = None
+    # Set after a successful HubSpot contact find-or-create so retries skip it.
+    hubspot_contact_id: str | None = None
 
 
 class Broker(ABC):

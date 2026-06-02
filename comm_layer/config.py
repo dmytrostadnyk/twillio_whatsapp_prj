@@ -48,8 +48,14 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
     COHERE_API_KEY: str
 
-    # ── Mock Azure CRM ──────────────────────────────────────────────────────────
-    AZURE_CRM_URL: str = "http://localhost:8001"
+    # ── HubSpot CRM ─────────────────────────────────────────────────────────────
+    # Service Key token — required, no default. Fails loudly at startup if unset.
+    # Create at: HubSpot → Settings → Integrations → Service Keys.
+    # Required scopes: crm.objects.contacts.read, crm.objects.contacts.write,
+    #                  crm.schemas.contacts.write
+    HUBSPOT_PRIVATE_APP_TOKEN: str
+    # Base URL for all HubSpot API calls. Overridable in tests.
+    HUBSPOT_BASE_URL: str = "https://api.hubapi.com"
 
     # ── AI kill switch ──────────────────────────────────────────────────────────
     # Set to False to instantly halt ALL AI calls without restarting the service.

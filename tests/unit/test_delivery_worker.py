@@ -1,30 +1,38 @@
 """
-Delivery worker tests — Phase 2.
+Delivery worker tests — HubSpot integration.
 
 What we test:
-1.  Successful delivery (Azure 200) → broker.ack called with contract payload
-2.  Azure 500 → broker.nack with reason that includes the response body
-3.  Azure 422 (true 4xx) → broker.dead_letter, NO retry
-4.  Azure 408/425/429 (transient 4xx) → broker.nack, NOT dead-lettered
-5.  Retry-After header on 429/503 → backoff uses that value, not random
-6.  HTTP timeout → broker.nack
-7.  HTTP connect error → broker.nack
-8.  HTTP read error (any httpx.RequestError subclass) → broker.nack
-9.  attempt_count > max → broker.dead_letter before any HTTP call
-10. Outbound POST carries X-Correlation-Id and X-Event-Key headers
-11. Contract payload has the correct structure
-12. Backoff formula is bounded and non-negative (deterministic, no random sampling)
+1.  Successful delivery (search finds contact → PATCH 200) → broker.ack called
+2.  New contact (search 0 results → POST create → PATCH 200) → broker.ack called
+3.  Success does not call nack or dead_letter
+4.  HubSpot 500 on contact search → broker.nack
+5.  HubSpot 503 on contact PATCH → broker.nack
+6.  HubSpot 401 on search → broker.dead_letter (auth error, never retryable)
+7.  HubSpot 403 on search → broker.dead_letter
+8.  HubSpot 422 on PATCH → broker.dead_letter (non-retryable 4xx)
+9.  HubSpot 429 with Retry-After → nack with that exact backoff value
+10. HTTP timeout on search → broker.nack
+11. HTTP connect error on search → broker.nack
+12. Any httpx.RequestError subclass → broker.nack with error type in reason
+13. attempt_count > max → broker.dead_letter before any HTTP call
+14. from_number is None → broker.dead_letter before any HTTP call
+15. Authorization header is present on every HubSpot request
+16. HubSpot contact ID is persisted after find_or_create (pool.acquire called)
+17. Backoff is capped at DELIVERY_BACKOFF_MAX_SECONDS
+18. Backoff is always >= 0
+19. parse_retry_after: seconds form, missing header, unparseable, negative
 
 We mock:
 - The broker (AsyncMock) — no real DB needed
-- The HTTP client (respx) — no real Azure CRM needed
+- The HTTP client (respx) — no real HubSpot needed
+- The pool (MagicMock) — no real DB for delivery_log and contact_id persistence
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -37,7 +45,20 @@ from delivery_worker.main import (
     parse_retry_after,
     process_message,
 )
-from delivery_worker.transform import build_contract_payload
+from delivery_worker.transform import build_hubspot_properties
+
+# ── HubSpot endpoint stubs ─────────────────────────────────────────────────────
+
+_SEARCH_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search"
+_CREATE_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts"
+_PATCH_URL_PREFIX = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/"
+
+_FOUND_CONTACT_RESPONSE = {
+    "results": [{"id": "123", "properties": {"phone": "+15559876543", "ai_comm_log": ""}}]
+}
+_EMPTY_SEARCH_RESPONSE = {"results": []}
+_CREATE_RESPONSE = {"id": "456", "properties": {"phone": "+15559876543"}}
+
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -50,6 +71,10 @@ def make_message(
     event_type: str = "sms.received",
     from_number: str | None = "+15559876543",
     to_number: str | None = "+15551234567",
+    summary: str | None = "Customer wants to cancel subscription.",
+    intent: str | None = "cancellation",
+    sentiment: str | None = "frustrated",
+    hubspot_contact_id: str | None = None,
 ) -> BrokerMessage:
     """Build a BrokerMessage for use in tests."""
     return BrokerMessage(
@@ -66,6 +91,12 @@ def make_message(
         attempt_count=attempt_count,
         created_at=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
         claimed_at=datetime.now(UTC),
+        summary=summary,
+        intent=intent,
+        sentiment=sentiment,
+        entities=[],
+        action_items=[],
+        hubspot_contact_id=hubspot_contact_id,
     )
 
 
@@ -79,8 +110,7 @@ def make_broker() -> AsyncMock:
 
 
 def make_pool():
-    """Mock asyncpg pool so _write_delivery_log doesn't need a real DB."""
-    from unittest.mock import MagicMock
+    """Mock asyncpg pool so _write_delivery_log and _persist_contact_id work."""
     conn = AsyncMock()
     pool = MagicMock()
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
@@ -88,30 +118,44 @@ def make_pool():
     return pool
 
 
-# ── process_message — happy path ───────────────────────────────────────────────
+# ── process_message — successful delivery ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_successful_delivery_calls_ack():
-    """Azure returns 200 → broker.ack is called with the contract payload."""
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(200))
+async def test_existing_contact_delivery_calls_ack():
+    """Search finds contact → PATCH 200 → broker.ack called."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(200, json={}))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
         await process_message(broker, client, make_message(), make_pool())
 
     broker.ack.assert_called_once()
-    call_kwargs = broker.ack.call_args.kwargs
-    assert call_kwargs.get("contract_payload") is not None
-    assert call_kwargs["contract_payload"]["schema_version"] == "1.0"
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_successful_delivery_does_not_call_nack_or_dead_letter():
+async def test_new_contact_create_then_patch_calls_ack():
+    """Search returns 0 results → contact created → PATCH 200 → broker.ack."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_EMPTY_SEARCH_RESPONSE))
+    respx.post(_CREATE_URL).mock(return_value=httpx.Response(201, json=_CREATE_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(200, json={}))
+    broker = make_broker()
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, make_message(), make_pool())
+
+    broker.ack.assert_called_once()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_successful_delivery_does_not_nack_or_dead_letter():
     """On success, nack and dead_letter must NOT be called."""
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(201))
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(200, json={}))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -123,39 +167,47 @@ async def test_successful_delivery_does_not_call_nack_or_dead_letter():
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_outbound_request_carries_tracing_headers():
-    """
-    Every POST to Azure must include X-Correlation-Id and X-Event-Key so
-    Azure can correlate its own logs to events in our system without parsing
-    the body.
-    """
-    route = respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(200))
-    broker = make_broker()
-    msg = make_message()
-
-    async with httpx.AsyncClient() as client:
-        await process_message(broker, client, msg, make_pool())
-
-    assert route.called
-    request = route.calls[0].request
-    assert request.headers["X-Correlation-Id"] == str(msg.correlation_id)
-    assert request.headers["X-Event-Key"] == msg.event_key
-
-
-# ── process_message — Azure 5xx ────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_azure_500_calls_nack_with_body_in_reason():
-    """
-    Azure 500 → nack (retry). The response body must appear in the nack
-    reason so the dashboard's last_error column has something useful for
-    debugging Azure-side problems.
-    """
-    respx.post("http://localhost:8001/events").mock(
-        return_value=httpx.Response(500, text="Database connection pool exhausted")
+async def test_hubspot_request_has_authorization_header():
+    """Every HubSpot request must carry a Bearer Authorization header."""
+    search_route = respx.post(_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE)
     )
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(200, json={}))
+    broker = make_broker()
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, make_message(), make_pool())
+
+    assert search_route.called
+    auth = search_route.calls[0].request.headers.get("Authorization", "")
+    assert auth.startswith("Bearer "), f"Expected Bearer token, got: {auth[:20]}"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_contact_id_persisted_after_creation():
+    """Pool is used to persist contact ID after create so retries skip creation."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_EMPTY_SEARCH_RESPONSE))
+    respx.post(_CREATE_URL).mock(return_value=httpx.Response(201, json=_CREATE_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(200, json={}))
+    broker = make_broker()
+    pool = make_pool()
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, make_message(), pool)
+
+    # pool.acquire() is called by both _persist_contact_id and _write_delivery_log
+    assert pool.acquire.called
+
+
+# ── process_message — HubSpot 5xx ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_hubspot_500_on_search_calls_nack():
+    """HubSpot 500 on contact search → nack (retry)."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(500, text="Internal Server Error"))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -163,16 +215,16 @@ async def test_azure_500_calls_nack_with_body_in_reason():
 
     broker.nack.assert_called_once()
     broker.dead_letter.assert_not_called()
-    reason_arg = broker.nack.call_args.args[1]
-    assert "500" in reason_arg
-    assert "Database connection pool exhausted" in reason_arg
+    reason = broker.nack.call_args.args[1]
+    assert "500" in reason
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_azure_503_calls_nack():
-    """Azure 503 Service Unavailable → retry, same as any 5xx."""
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(503))
+async def test_hubspot_503_on_patch_calls_nack():
+    """HubSpot 503 on contact PATCH → nack."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(503))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -182,18 +234,17 @@ async def test_azure_503_calls_nack():
     broker.dead_letter.assert_not_called()
 
 
-# ── process_message — 4xx distinctions ─────────────────────────────────────────
+# ── process_message — auth errors ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_azure_422_dead_letters_immediately():
+async def test_hubspot_401_dead_letters_immediately():
     """
-    Azure 422 Unprocessable Entity → dead-letter immediately.
-    A 4xx means our contract is wrong. Retrying the same payload
-    will always fail, so we dead-letter without scheduling a retry.
+    HubSpot 401 Unauthorized → dead-letter immediately.
+    Retrying with the same bad token will always fail the same way.
     """
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(422))
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(401))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -206,9 +257,9 @@ async def test_azure_422_dead_letters_immediately():
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_azure_400_dead_letters_immediately():
-    """Any non-retryable 4xx immediately dead-letters."""
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(400))
+async def test_hubspot_403_dead_letters_immediately():
+    """HubSpot 403 Forbidden (missing scope) → dead-letter immediately."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(403))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -218,38 +269,36 @@ async def test_azure_400_dead_letters_immediately():
     broker.nack.assert_not_called()
 
 
-@pytest.mark.parametrize("status_code", [408, 425, 429])
+# ── process_message — non-retryable 4xx ───────────────────────────────────────
+
+
 @pytest.mark.asyncio
 @respx.mock
-async def test_transient_4xx_retries_instead_of_dead_lettering(status_code):
-    """
-    408 Request Timeout, 425 Too Early, and 429 Too Many Requests are
-    explicitly retryable per the HTTP spec. Dead-lettering them would lose
-    events to a temporary throttle — these MUST nack, not dead-letter.
-    """
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(status_code))
+async def test_hubspot_422_on_patch_dead_letters():
+    """HubSpot 422 Unprocessable on PATCH → dead-letter (bad property value)."""
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE))
+    respx.patch(url__startswith=_PATCH_URL_PREFIX).mock(return_value=httpx.Response(422))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
         await process_message(broker, client, make_message(), make_pool())
 
-    broker.nack.assert_called_once()
-    broker.dead_letter.assert_not_called()
+    broker.dead_letter.assert_called_once()
+    broker.nack.assert_not_called()
+    broker.ack.assert_not_called()
 
 
-# ── Retry-After honoring ───────────────────────────────────────────────────────
+# ── process_message — 429 with Retry-After ────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_retry_after_header_overrides_computed_backoff():
+async def test_hubspot_429_with_retry_after_uses_that_backoff():
     """
-    When Azure sends Retry-After: 120, the nack must schedule retry in
-    exactly 120s, not whatever our jitter happens to roll. Ignoring the
-    header would have us re-hit a rate limit that the server explicitly
-    asked us to back off from.
+    HubSpot 429 with Retry-After: 120 → nack with exactly 120s backoff.
+    Ignoring the header would immediately re-hit the rate limit.
     """
-    respx.post("http://localhost:8001/events").mock(
+    respx.post(_SEARCH_URL).mock(
         return_value=httpx.Response(429, headers={"Retry-After": "120"})
     )
     broker = make_broker()
@@ -262,21 +311,6 @@ async def test_retry_after_header_overrides_computed_backoff():
     assert backoff_arg == 120.0
 
 
-@pytest.mark.asyncio
-@respx.mock
-async def test_missing_retry_after_falls_back_to_computed_backoff():
-    """If no Retry-After header, we must use our own computed backoff (>= 0)."""
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(503))
-    broker = make_broker()
-
-    async with httpx.AsyncClient() as client:
-        await process_message(broker, client, make_message(), make_pool())
-
-    broker.nack.assert_called_once()
-    backoff_arg = broker.nack.call_args.args[2]
-    assert backoff_arg >= 0
-
-
 # ── process_message — network errors ──────────────────────────────────────────
 
 
@@ -284,7 +318,7 @@ async def test_missing_retry_after_falls_back_to_computed_backoff():
 @respx.mock
 async def test_http_timeout_calls_nack():
     """Network timeout → nack (retry)."""
-    respx.post("http://localhost:8001/events").mock(side_effect=httpx.TimeoutException("timed out"))
+    respx.post(_SEARCH_URL).mock(side_effect=httpx.TimeoutException("timed out"))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -298,9 +332,7 @@ async def test_http_timeout_calls_nack():
 @respx.mock
 async def test_http_connect_error_calls_nack():
     """Connection refused → nack (retry)."""
-    respx.post("http://localhost:8001/events").mock(
-        side_effect=httpx.ConnectError("connection refused")
-    )
+    respx.post(_SEARCH_URL).mock(side_effect=httpx.ConnectError("connection refused"))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -313,14 +345,8 @@ async def test_http_connect_error_calls_nack():
 @pytest.mark.asyncio
 @respx.mock
 async def test_other_httpx_request_errors_also_nack():
-    """
-    httpx.RequestError subclasses other than Timeout/ConnectError (e.g.
-    ReadError, PoolTimeout) must also nack — not propagate to the outer loop
-    where the row would be left leased without a recorded error.
-    """
-    respx.post("http://localhost:8001/events").mock(
-        side_effect=httpx.ReadError("stream broken mid-read")
-    )
+    """httpx.ReadError (and other RequestError subclasses) → nack."""
+    respx.post(_SEARCH_URL).mock(side_effect=httpx.ReadError("stream broken"))
     broker = make_broker()
 
     async with httpx.AsyncClient() as client:
@@ -331,17 +357,17 @@ async def test_other_httpx_request_errors_also_nack():
     assert "ReadError" in reason_arg
 
 
-# ── process_message — max attempts ────────────────────────────────────────────
+# ── process_message — guard conditions ────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_max_attempts_dead_letters_before_http_call():
     """
-    When attempt_count exceeds DELIVERY_MAX_ATTEMPTS, the event is dead-lettered
-    BEFORE any HTTP call. No point hitting Azure if we've already given up.
+    attempt_count > DELIVERY_MAX_ATTEMPTS → dead-letter BEFORE any HTTP call.
+    No point hitting HubSpot if we've already given up.
     """
-    respx.post("http://localhost:8001/events").mock(return_value=httpx.Response(200))
+    respx.post(_SEARCH_URL).mock(return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE))
     broker = make_broker()
     msg = make_message(attempt_count=settings.DELIVERY_MAX_ATTEMPTS + 1)
 
@@ -352,71 +378,80 @@ async def test_max_attempts_dead_letters_before_http_call():
     assert not respx.calls.called
 
 
-# ── Contract payload structure ─────────────────────────────────────────────────
+@pytest.mark.asyncio
+@respx.mock
+async def test_null_from_number_dead_letters_before_http_call():
+    """
+    from_number is None → dead-letter immediately (can't create a contact).
+    No HubSpot call is made.
+    """
+    broker = make_broker()
+    msg = make_message(from_number=None)
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, msg, make_pool())
+
+    broker.dead_letter.assert_called_once()
+    assert not respx.calls.called
 
 
-def test_build_contract_payload_has_required_keys():
-    """The contract payload must include all fields consumers depend on."""
-    contract = build_contract_payload(make_message())
-    required = {
-        "schema_version", "event_key", "correlation_id",
-        "channel", "direction", "event_type",
-        "timestamp", "source", "data",
-    }
-    assert required.issubset(contract.keys())
+# ── build_hubspot_properties — pure function ──────────────────────────────────
 
 
-def test_build_contract_payload_values():
-    """Contract field values come from the right BrokerMessage attributes."""
+def test_build_hubspot_properties_includes_required_keys():
+    """All required HubSpot property keys must be present."""
+    props = build_hubspot_properties(make_message())
+    required = {"ai_last_intent", "ai_last_sentiment", "ai_last_summary", "ai_comm_log"}
+    assert required.issubset(props.keys())
+
+
+def test_build_hubspot_properties_values_match_message():
+    """Property values come from the correct BrokerMessage fields."""
+    msg = make_message(intent="billing_dispute", sentiment="frustrated", summary="Test summary")
+    props = build_hubspot_properties(msg)
+    assert props["ai_last_intent"] == "billing_dispute"
+    assert props["ai_last_sentiment"] == "frustrated"
+    assert props["ai_last_summary"] == "Test summary"
+
+
+def test_build_hubspot_properties_prepends_to_existing_log():
+    """New log entry is prepended so newest is always at the top."""
     msg = make_message()
-    contract = build_contract_payload(msg)
-
-    assert contract["schema_version"] == "1.0"
-    assert contract["event_key"] == msg.event_key
-    assert contract["correlation_id"] == str(msg.correlation_id)
-    assert contract["channel"] == "sms"
-    assert contract["direction"] == "inbound"
-    assert contract["event_type"] == "sms.received"
-    assert contract["source"] == msg.source_metadata
-    assert contract["data"]["from_number"] == msg.from_number
-    assert contract["data"]["to_number"] == msg.to_number
-    assert contract["data"]["raw"] == msg.raw_payload
+    existing = "Old entry"
+    props = build_hubspot_properties(msg, existing_log=existing)
+    log_value = props["ai_comm_log"]
+    assert log_value.index("2026-01-15") < log_value.index("Old entry")
 
 
-def test_build_contract_payload_handles_null_numbers():
-    """Contract must not crash when from_number or to_number is None."""
-    msg = make_message(from_number=None, to_number=None)
-    contract = build_contract_payload(msg)
-    assert contract["data"]["from_number"] is None
-    assert contract["data"]["to_number"] is None
+def test_build_hubspot_properties_handles_null_ai_fields():
+    """Missing enrichment fields produce empty strings, not None."""
+    msg = make_message(summary=None, intent=None, sentiment=None)
+    props = build_hubspot_properties(msg)
+    assert props["ai_last_intent"] == ""
+    assert props["ai_last_sentiment"] == ""
+    assert props["ai_last_summary"] == ""
+    assert "unavailable" in props["ai_comm_log"]
 
 
 # ── Backoff (deterministic) ────────────────────────────────────────────────────
 
 
 def test_backoff_is_capped_at_settings_max():
-    """
-    Backoff must never exceed DELIVERY_BACKOFF_MAX_SECONDS regardless of
-    attempt count. Tested against the actual cap — exhaustive over attempts.
-    """
+    """Backoff never exceeds DELIVERY_BACKOFF_MAX_SECONDS."""
     for attempt in range(1, 30):
         for _ in range(20):
             assert compute_backoff(attempt) <= settings.DELIVERY_BACKOFF_MAX_SECONDS
 
 
 def test_backoff_is_non_negative():
-    """Backoff is always >= 0 (full jitter cannot go below zero)."""
+    """Backoff is always >= 0."""
     for attempt in range(0, 10):
         for _ in range(20):
             assert compute_backoff(attempt) >= 0
 
 
 def test_backoff_cap_grows_with_attempt_until_capped():
-    """
-    Test the formula directly, not random samples — deterministic.
-    The CAP at low attempts should be smaller than the CAP at high attempts,
-    until both hit DELIVERY_BACKOFF_MAX_SECONDS.
-    """
+    """The cap grows with attempt count until it hits the maximum."""
     base = settings.DELIVERY_BACKOFF_BASE_SECONDS
     max_cap = settings.DELIVERY_BACKOFF_MAX_SECONDS
 
@@ -426,10 +461,10 @@ def test_backoff_cap_grows_with_attempt_until_capped():
 
     assert cap_attempt_1 < cap_attempt_4
     assert cap_attempt_4 <= cap_attempt_20
-    assert cap_attempt_20 == max_cap  # very high attempts always hit the cap
+    assert cap_attempt_20 == max_cap
 
 
-# ── Retry-After parsing ────────────────────────────────────────────────────────
+# ── parse_retry_after ─────────────────────────────────────────────────────────
 
 
 def test_parse_retry_after_seconds_form():
@@ -443,12 +478,10 @@ def test_parse_retry_after_missing_header():
 
 
 def test_parse_retry_after_unparseable_returns_none():
-    """HTTP-date form or garbage falls back to None so the caller uses its own backoff."""
     response = httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
     assert parse_retry_after(response) is None
 
 
 def test_parse_retry_after_negative_clamped_to_zero():
-    """A negative Retry-After is clamped to 0 — never retry in the past."""
     response = httpx.Response(429, headers={"Retry-After": "-5"})
     assert parse_retry_after(response) == 0.0

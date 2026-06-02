@@ -24,6 +24,12 @@ from comm_layer.contracts.base import EventSource
 
 log = structlog.get_logger(__name__)
 
+# Only these event types carry meaningful content that gets enriched by GPT-4o
+# and should be delivered to HubSpot. Status callbacks (sms.status, call.started,
+# call.completed, etc.) are persisted for audit but never enriched, so they must
+# NOT be published — they would sit 'pending' forever under the enrichment gate.
+_DELIVERABLE_TYPES = frozenset({"sms.received", "whatsapp.received", "recording.ready"})
+
 
 async def ingest_event(
     pool: asyncpg.Pool,
@@ -119,7 +125,14 @@ async def ingest_event(
             log.info("ingest.duplicate_ignored", event_key=event_key)
             return False
 
-    # New event — publish to broker so the delivery worker picks it up
-    await broker.publish(row["id"])
-    log.info("ingest.event_queued", event_id=str(row["id"]), channel=channel)
+    # Only publish event types that will be enriched and delivered to HubSpot.
+    if event_type in _DELIVERABLE_TYPES:
+        await broker.publish(row["id"])
+        log.info("ingest.event_queued", event_id=str(row["id"]), channel=channel)
+    else:
+        log.info(
+            "ingest.event_persisted_not_queued",
+            event_id=str(row["id"]),
+            event_type=event_type,
+        )
     return True

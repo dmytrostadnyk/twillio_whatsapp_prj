@@ -71,22 +71,34 @@ class PostgresBroker(Broker):
         setting next_retry_at = NOW() + DELIVERY_LEASE_SECONDS, the row is
         hidden from other workers while we process it. If the worker crashes
         before ack/nack, the lease expires and another worker re-claims the row.
+
+        WHY INNER JOIN enrichments with status IN ('completed','failed','skipped'):
+        Delivery is gated on enrichment completion. This ensures the HubSpot
+        contact update always carries the AI summary/intent/sentiment. Events
+        stay invisible to the delivery worker until the intelligence layer finishes
+        (or gives up). FOR UPDATE OF ce locks only comm_events — not enrichments —
+        so the enrichment worker is never blocked by the delivery worker.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
-                    SELECT id, event_key, correlation_id,
-                           channel, direction, event_type,
-                           from_number, to_number,
-                           source_metadata, raw_payload,
-                           attempt_count, created_at
-                    FROM comm_events
-                    WHERE delivery_status IN ('pending', 'failed')
-                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-                    ORDER BY created_at
+                    SELECT ce.id, ce.event_key, ce.correlation_id,
+                           ce.channel, ce.direction, ce.event_type,
+                           ce.from_number, ce.to_number,
+                           ce.source_metadata, ce.raw_payload,
+                           ce.attempt_count, ce.created_at,
+                           ce.hubspot_contact_id,
+                           e.summary, e.intent, e.sentiment,
+                           e.entities, e.action_items
+                    FROM comm_events ce
+                    INNER JOIN enrichments e ON e.comm_event_id = ce.id
+                    WHERE ce.delivery_status IN ('pending', 'failed')
+                      AND (ce.next_retry_at IS NULL OR ce.next_retry_at <= NOW())
+                      AND e.status IN ('completed', 'failed', 'skipped')
+                    ORDER BY ce.created_at
                     LIMIT 1
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF ce SKIP LOCKED
                     """
                 )
 
@@ -120,6 +132,12 @@ class PostgresBroker(Broker):
                     attempt_count=row["attempt_count"] + 1,
                     created_at=row["created_at"],
                     claimed_at=datetime.now(UTC),
+                    summary=row["summary"],
+                    intent=row["intent"],
+                    sentiment=row["sentiment"],
+                    entities=row["entities"] if row["entities"] is not None else [],
+                    action_items=row["action_items"] if row["action_items"] is not None else [],
+                    hubspot_contact_id=row["hubspot_contact_id"],
                 )
 
         log.debug(

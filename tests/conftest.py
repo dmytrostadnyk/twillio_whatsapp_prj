@@ -31,7 +31,7 @@ os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "fake_service_role_key")
 os.environ.setdefault("DATABASE_URL", "postgresql://fake:fake@localhost:5432/fake")
 os.environ.setdefault("OPENAI_API_KEY", "sk-fake")
 os.environ.setdefault("COHERE_API_KEY", "fake_cohere_key")
-os.environ.setdefault("AZURE_CRM_URL", "http://localhost:8001")
+os.environ.setdefault("HUBSPOT_PRIVATE_APP_TOKEN", "pat-na1-fake-token-for-unit-tests")
 os.environ.setdefault("AI_ENABLED", "false")
 os.environ.setdefault("PUBLIC_BASE_URL", "https://fake.ngrok-free.app")
 
