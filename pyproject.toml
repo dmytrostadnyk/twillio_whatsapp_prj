@@ -51,7 +51,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["comm_layer*", "delivery_worker*", "intelligence_layer*", "mock_azure_crm*", "dashboard*"]
+include = ["comm_layer*", "delivery_worker*", "intelligence_layer*", "dashboard*"]
 
 # ── Ruff linting ───────────────────────────────────────────────────────────────
 [tool.ruff]
@@ -77,7 +77,7 @@ ignore_missing_imports = true   # external stubs often missing; tighten in prod
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--cov=comm_layer --cov=delivery_worker --cov=mock_azure_crm --cov-report=term-missing"
+addopts = "--cov=comm_layer --cov=delivery_worker --cov=intelligence_layer --cov-report=term-missing"
 markers = [
     "integration: tests that require a real database and live env vars; require DATABASE_URL and INTEGRATION_TEST_CONFIRMED=1",
 ]

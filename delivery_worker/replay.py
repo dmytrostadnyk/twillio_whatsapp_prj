@@ -11,19 +11,19 @@ WHY you need this:
 Events land in the dead-letter state ('dead') when they've failed
 DELIVERY_MAX_ATTEMPTS times. The most common causes are:
 
-  1. Azure CRM was down for a long time and retries were exhausted.
-     Fix: bring Azure back up, then replay.
+  1. HubSpot was down for an extended time and retries were exhausted.
+     Fix: confirm HubSpot is healthy, then replay.
 
-  2. A bug in the contract payload caused Azure to return 4xx.
+  2. A bad HUBSPOT_PRIVATE_APP_TOKEN (expired or wrong scopes → 401/403).
+     Fix: regenerate the token in HubSpot → Settings → Integrations, update
+     the env var, restart the delivery worker, then replay.
+
+  3. A bug in the property values caused HubSpot to return 4xx.
      Fix: fix the bug, deploy the worker, then replay.
 
-  3. A bad environment variable (wrong AZURE_CRM_URL).
-     Fix: correct the variable, then replay.
-
 This module sets delivery_status = 'pending' and resets attempt_count = 0
-so the worker treats each event as fresh. The event_key uniqueness constraint
-still protects against double-writes downstream — Azure CRM will idempotently
-handle events it already received.
+so the worker treats each event as fresh. The HubSpot contact update is
+idempotent — replaying the same event just overwrites the same properties.
 
 Events are replayed in created_at order (oldest first) to preserve original
 arrival order as closely as possible.

@@ -8,7 +8,7 @@ This handler must respond in < 1 second. It does exactly four things:
   3. Persist the event (idempotent — duplicates are silently dropped)
   4. Return empty TwiML so Twilio knows we received it
 
-No AI. No Azure. No business logic. Just durable capture and fast ACK.
+No AI. No CRM. No business logic. Just durable capture and fast ACK.
 """
 
 from __future__ import annotations

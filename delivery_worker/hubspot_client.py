@@ -152,6 +152,10 @@ async def find_or_create_contact(
     Fetching the current log during search avoids a separate GET call later.
     The caller prepends the new entry to this existing value.
 
+    NOTE: 'id' is intentionally NOT in the properties list — it is not a
+    HubSpot property name; the contact id is always returned at the top level.
+    Some HubSpot versions reject unknown property names in the list.
+
     Raises httpx.HTTPStatusError on non-2xx responses so the delivery worker
     can apply its standard ack/nack/dead-letter logic based on the status code.
     """
@@ -173,7 +177,7 @@ async def find_or_create_contact(
                     ]
                 }
             ],
-            "properties": ["id", "phone", "ai_comm_log"],
+            "properties": ["phone", "ai_comm_log"],
             "limit": 1,
         },
         timeout=10.0,
@@ -199,6 +203,37 @@ async def find_or_create_contact(
     contact_id = create_resp.json()["id"]
     log.info("hubspot.contact_created", contact_id=contact_id)
     return contact_id, ""
+
+
+async def get_contact_log(
+    client: httpx.AsyncClient,
+    token: str,
+    base_url: str,
+    contact_id: str,
+) -> str:
+    """
+    Fetch the current ai_comm_log for an existing contact by ID.
+
+    WHY this exists:
+    On retries, hubspot_contact_id is already persisted so we skip
+    find_or_create_contact entirely — but we must still read the current log
+    before prepending the new entry. Without this, the PATCH would overwrite
+    the entire history with only the current event, destroying all prior entries.
+
+    Returns the current log value, or "" if the property is not yet set.
+    Raises httpx.HTTPStatusError on non-2xx so the delivery worker maps errors
+    to nack/dead-letter via its standard _handle_http_error helper.
+    """
+    headers = _auth_headers(token)
+    resp = await client.get(
+        f"{base_url}/crm/v3/objects/contacts/{contact_id}",
+        headers=headers,
+        params={"properties": "ai_comm_log"},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    properties = resp.json().get("properties") or {}
+    return properties.get("ai_comm_log") or ""
 
 
 async def update_contact(

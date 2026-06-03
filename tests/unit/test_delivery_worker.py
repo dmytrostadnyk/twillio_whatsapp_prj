@@ -21,6 +21,11 @@ What we test:
 17. Backoff is capped at DELIVERY_BACKOFF_MAX_SECONDS
 18. Backoff is always >= 0
 19. parse_retry_after: seconds form, missing header, unparseable, negative
+20. Retry path: GET is issued to re-fetch log; PATCH ai_comm_log contains both
+    the new entry AND the prior history (regression for the log-wipe bug)
+21. Retry path: GET 5xx → nack, no PATCH made (fail safe — never wipe on error)
+22. DB dedup: when DB already has a hubspot_contact_id for the phone number,
+    HubSpot search/create is NOT called (avoids search-lag duplicates)
 
 We mock:
 - The broker (AsyncMock) — no real DB needed
@@ -30,6 +35,7 @@ We mock:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -52,6 +58,14 @@ from delivery_worker.transform import build_hubspot_properties
 _SEARCH_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/search"
 _CREATE_URL = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts"
 _PATCH_URL_PREFIX = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/"
+_GET_URL_PREFIX = f"{settings.HUBSPOT_BASE_URL}/crm/v3/objects/contacts/"
+
+# Contact with a pre-existing log — used for retry-path tests
+_EXISTING_CONTACT_ID = "existing-456"
+_GET_CONTACT_WITH_LOG = {
+    "id": _EXISTING_CONTACT_ID,
+    "properties": {"ai_comm_log": "Prior history entry"},
+}
 
 _FOUND_CONTACT_RESPONSE = {
     "results": [{"id": "123", "properties": {"phone": "+15559876543", "ai_comm_log": ""}}]
@@ -109,9 +123,20 @@ def make_broker() -> AsyncMock:
     return broker
 
 
-def make_pool():
-    """Mock asyncpg pool so _write_delivery_log and _persist_contact_id work."""
+def make_pool(db_contact_id: str | None = None):
+    """
+    Mock asyncpg pool so _write_delivery_log, _persist_contact_id, and
+    _lookup_contact_id_by_phone work.
+
+    db_contact_id: if set, fetchrow() returns a dict simulating a DB row with
+    an existing hubspot_contact_id for the phone (used for dedup tests).
+    """
     conn = AsyncMock()
+    # _lookup_contact_id_by_phone calls fetchrow; everything else calls execute.
+    if db_contact_id is not None:
+        conn.fetchrow = AsyncMock(return_value={"hubspot_contact_id": db_contact_id})
+    else:
+        conn.fetchrow = AsyncMock(return_value=None)
     pool = MagicMock()
     pool.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
     pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -355,6 +380,148 @@ async def test_other_httpx_request_errors_also_nack():
     broker.nack.assert_called_once()
     reason_arg = broker.nack.call_args.args[1]
     assert "ReadError" in reason_arg
+
+
+# ── process_message — retry path (log re-fetch) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_retry_path_fetches_current_log_before_patch():
+    """
+    Regression test for the log-wipe bug:
+    When hubspot_contact_id is already set (retry path), a GET must be issued
+    to read the current ai_comm_log. The subsequent PATCH must contain BOTH the
+    new entry AND the existing history — never overwrite with only the new entry.
+    """
+    get_route = respx.get(
+        f"{_GET_URL_PREFIX}{_EXISTING_CONTACT_ID}"
+    ).mock(return_value=httpx.Response(200, json=_GET_CONTACT_WITH_LOG))
+
+    patch_route = respx.patch(
+        f"{_PATCH_URL_PREFIX}{_EXISTING_CONTACT_ID}"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    broker = make_broker()
+    # Simulate a retry: hubspot_contact_id is already persisted
+    msg = make_message(hubspot_contact_id=_EXISTING_CONTACT_ID)
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, msg, make_pool())
+
+    # GET must be called to fetch the live log
+    assert get_route.called, "GET was not called — existing log would be lost"
+
+    # PATCH body must include BOTH the new entry and the prior history
+    assert patch_route.called
+    patch_body = json.loads(patch_route.calls[0].request.content)
+    comm_log = patch_body["properties"]["ai_comm_log"]
+    assert "Prior history entry" in comm_log, (
+        f"Prior history was wiped from ai_comm_log:\n{comm_log}"
+    )
+
+    broker.ack.assert_called_once()
+    broker.nack.assert_not_called()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_retry_path_get_5xx_nacks_without_patching():
+    """
+    Fail-safe: if the GET to fetch the current log returns 5xx, we must nack
+    (not make a PATCH that would destroy the history with an empty log).
+    """
+    respx.get(
+        f"{_GET_URL_PREFIX}{_EXISTING_CONTACT_ID}"
+    ).mock(return_value=httpx.Response(500))
+
+    patch_route = respx.patch(
+        f"{_PATCH_URL_PREFIX}{_EXISTING_CONTACT_ID}"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    broker = make_broker()
+    msg = make_message(hubspot_contact_id=_EXISTING_CONTACT_ID)
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, msg, make_pool())
+
+    broker.nack.assert_called_once()
+    broker.ack.assert_not_called()
+    assert not patch_route.called, "PATCH must not be called when GET fails"
+
+
+# ── process_message — DB dedup (Batch E) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_db_dedup_skips_hubspot_search_when_contact_known():
+    """
+    When our DB already has a hubspot_contact_id for the calling phone number,
+    the HubSpot search/create endpoints must NOT be called — the DB value is
+    used directly, avoiding search-lag duplicate contacts.
+
+    The GET for the live log and the PATCH still run.
+    """
+    db_contact_id = "db-known-789"
+
+    get_route = respx.get(
+        f"{_GET_URL_PREFIX}{db_contact_id}"
+    ).mock(return_value=httpx.Response(200, json={"id": db_contact_id, "properties": {}}))
+    patch_route = respx.patch(
+        f"{_PATCH_URL_PREFIX}{db_contact_id}"
+    ).mock(return_value=httpx.Response(200, json={}))
+    search_route = respx.post(_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json=_EMPTY_SEARCH_RESPONSE)
+    )
+
+    broker = make_broker()
+    # Pool returns the db_contact_id from fetchrow (simulating a prior event for
+    # the same phone that already has a contact persisted).
+    pool = make_pool(db_contact_id=db_contact_id)
+
+    async with httpx.AsyncClient() as client:
+        await process_message(broker, client, make_message(), pool)
+
+    assert not search_route.called, (
+        "HubSpot search must NOT be called when DB already has the contact id"
+    )
+    assert get_route.called, "GET for live log must still run"
+    assert patch_route.called, "PATCH must still run"
+    broker.ack.assert_called_once()
+
+
+# ── process_message — HubSpot rate limit (Batch C) ───────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_empty_rate_limiter_nacks_before_http_call():
+    """
+    When the client-side HubSpot rate limiter is exhausted, process_message
+    must nack (reschedule) WITHOUT making any HubSpot HTTP calls.
+    This verifies the global rule: every external integration needs a rate limit.
+    """
+    from comm_layer.rate_limiter import TokenBucket
+
+    # Create a bucket with zero capacity — immediately exhausted.
+    empty_bucket = TokenBucket(capacity=1, refill_rate=0.0)
+    await empty_bucket.consume()  # drain the one token
+
+    search_route = respx.post(_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json=_FOUND_CONTACT_RESPONSE)
+    )
+    broker = make_broker()
+
+    async with httpx.AsyncClient() as client:
+        await process_message(
+            broker, client, make_message(), make_pool(), rate_limiter=empty_bucket
+        )
+
+    broker.nack.assert_called_once()
+    broker.dead_letter.assert_not_called()
+    broker.ack.assert_not_called()
+    assert not search_route.called, "No HubSpot calls must be made when rate-limited"
 
 
 # ── process_message — guard conditions ────────────────────────────────────────

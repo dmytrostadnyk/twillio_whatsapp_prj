@@ -18,6 +18,7 @@ from openai import OpenAI
 
 from comm_layer.config import settings
 from comm_layer.contracts.enriched import EnrichmentData
+from intelligence_layer.transcription import transcribe_recording_for_event
 
 log = structlog.get_logger()
 
@@ -70,29 +71,53 @@ async def enrich_event(pool, supabase, event: dict) -> None:
     Orchestrate enrichment for one comm_event row.
 
     Steps:
-    1. Extract the text content we will send to GPT-4o.
-    2. Call GPT-4o (in a thread, up to 3 total attempts).
-    3. Write the result (or failure) to the enrichments table.
+    1. For recording.ready: if no transcript exists yet, run Whisper inline.
+    2. Extract the text content we will send to GPT-4o.
+    3. Call GPT-4o (in a thread, up to 3 total attempts).
+    4. Write the result (or failure) to the enrichments table.
 
     The enrichments row was already inserted with status='processing' by
     consumer.claim_next() before this function is called.
+
+    WHY transcription runs here (not in the webhook tier):
+    Moving transcription into the enrichment worker gives it crash-recovery via
+    the enrichment lease (migration 0010). A fire-and-forget asyncio.Task in the
+    webhook tier had no retry path — a process restart silently lost the transcript.
     """
     comm_event_id = str(event["id"])
     event_type = event["event_type"]
     correlation_id = str(event.get("correlation_id", ""))
 
+    # Step 1 (voice only): transcribe if the recording.ready event has no transcript.
+    # consumer.claim_next no longer gates on transcript existence — it claims the
+    # recording.ready event immediately and lets us handle transcription here.
+    if event_type == "recording.ready" and not event.get("transcript_text"):
+        recording_url = (event.get("raw_payload") or {}).get("RecordingUrl", "")
+        recording_sid = (event.get("raw_payload") or {}).get("RecordingSid", "")
+        transcript_text = await transcribe_recording_for_event(
+            pool,
+            event["id"],
+            recording_url,
+            recording_sid,
+        )
+        # Inject the transcript text so _extract_content can find it.
+        event = {**event, "transcript_text": transcript_text}
+
     content = _extract_content(event)
     if content is None:
-        # This should not happen — consumer.py filters these out — but guard anyway.
-        log.warning(
-            "enrichment.no_content",
+        # No text to enrich (e.g. SMS with empty body, or recording with no transcript).
+        # This is distinct from an AI failure — we mark it 'skipped' so the delivery
+        # gate (which accepts 'completed', 'failed', 'skipped') can still deliver it
+        # with the "(AI enrichment unavailable)" note instead of blocking forever.
+        log.info(
+            "enrichment.skipped_no_content",
             comm_event_id=comm_event_id,
             event_type=event_type,
         )
         await _update_enrichment(
-            supabase,
+            pool,
             comm_event_id,
-            status="failed",
+            status="skipped",
             failure_reason="no_content",
         )
         return
@@ -111,7 +136,7 @@ async def enrich_event(pool, supabase, event: dict) -> None:
 
     if enrichment_data is None:
         await _update_enrichment(
-            supabase,
+            pool,
             comm_event_id,
             status="failed",
             failure_reason="gpt4o_all_attempts_failed",
@@ -119,7 +144,7 @@ async def enrich_event(pool, supabase, event: dict) -> None:
         return
 
     await _update_enrichment(
-        supabase,
+        pool,
         comm_event_id,
         status="completed",
         summary=enrichment_data.summary,
@@ -229,18 +254,36 @@ def _call_gpt4o_sync(content: str, event_type: str) -> EnrichmentData:
     return result
 
 
-async def _update_enrichment(supabase, comm_event_id: str, *, status: str, **fields) -> None:
+async def _update_enrichment(pool, comm_event_id: str, *, status: str, **fields) -> None:
     """
-    Write enrichment results (or failure) back to the enrichments table.
+    Write enrichment results (or failure) back to the enrichments table via asyncpg.
+
+    WHY asyncpg instead of supabase-py:
+    All other writes on the enrichment critical path use asyncpg. Using supabase-py
+    PostgREST here created a dual-transport problem: a failed supabase HTTP call
+    could leave the enrichment row stuck at 'processing' with no recovery path,
+    while asyncpg failures surface as exceptions that trigger the caller's retry
+    logic. Consolidating to asyncpg makes failure modes consistent.
 
     WHY **fields: the happy path needs summary/intent/sentiment/entities/action_items;
-    the failure path only needs status + failure_reason. One function handles both.
+    the failure path only needs status + failure_reason. One function handles both
+    by building the SET clause dynamically from the passed fields.
     """
-    payload = {"status": status, **fields}
+    import json as _json
 
-    await (
-        supabase.table("enrichments")
-        .update(payload)
-        .eq("comm_event_id", comm_event_id)
-        .execute()
-    )
+    # Build the dynamic SET clause: status is always updated; other fields only
+    # if passed. Using parameterised values avoids any SQL injection risk.
+    set_parts = ["status = $2", "updated_at = NOW()"]
+    params: list = [comm_event_id, status]
+
+    for key, value in fields.items():
+        # JSONB columns (entities, action_items) must be passed as JSON strings.
+        if isinstance(value, (list, dict)):
+            value = _json.dumps(value)
+        params.append(value)
+        set_parts.append(f"{key} = ${len(params)}")
+
+    sql = f"UPDATE enrichments SET {', '.join(set_parts)} WHERE comm_event_id = $1"
+
+    async with pool.acquire() as conn:
+        await conn.execute(sql, *params)

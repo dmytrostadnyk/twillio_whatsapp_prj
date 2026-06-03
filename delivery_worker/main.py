@@ -45,9 +45,11 @@ from comm_layer.broker.postgres import PostgresBroker
 from comm_layer.config import settings
 from comm_layer.db import create_pool
 from comm_layer.logging_config import configure_logging
+from comm_layer.rate_limiter import RateLimitExceededError, TokenBucket
 from delivery_worker.hubspot_client import (
     ensure_custom_properties,
     find_or_create_contact,
+    get_contact_log,
     update_contact,
 )
 from delivery_worker.transform import build_hubspot_properties
@@ -77,9 +79,15 @@ def compute_backoff(attempt: int) -> float:
     the window avoids this.
 
     Formula: cap = min(base * 2^attempt, max); jitter = random(0, cap)
+
+    WHY we cap the exponent before shifting:
+    2 ** attempt overflows fast for large attempt values (e.g. if DELIVERY_MAX_ATTEMPTS
+    is ever raised). Capping the exponent at 16 (2^16 = 65536) keeps arithmetic in
+    safe integer range before DELIVERY_BACKOFF_MAX_SECONDS clips the result anyway.
     """
+    safe_attempt = min(attempt, 16)
     cap = min(
-        settings.DELIVERY_BACKOFF_BASE_SECONDS * (2 ** attempt),
+        settings.DELIVERY_BACKOFF_BASE_SECONDS * (2 ** safe_attempt),
         settings.DELIVERY_BACKOFF_MAX_SECONDS,
     )
     return random.uniform(0, cap)
@@ -149,6 +157,42 @@ async def _persist_contact_id(pool, event_id, contact_id: str) -> None:
         )
 
 
+async def _lookup_contact_id_by_phone(pool, phone: str) -> str | None:
+    """
+    Look up the HubSpot contact ID for a phone number in our own DB.
+
+    WHY our DB instead of HubSpot search:
+    HubSpot's /search index is eventually consistent (lags writes by seconds).
+    Two events from the same new caller arriving in rapid succession would both
+    get empty search results and each create a separate contact — the "3,000
+    duplicate contacts" problem. Our DB is strongly consistent: as soon as one
+    event's _persist_contact_id() commits, this query returns the id, and the
+    second event reuses the existing contact rather than creating a duplicate.
+
+    We normalize the phone before lookup because WhatsApp numbers are stored
+    with the 'whatsapp:' prefix in comm_events.from_number but we compare
+    against the normalize_phone()-cleaned form used in all HubSpot calls.
+    The query therefore matches both the raw 'whatsapp:+1...' form and the
+    plain '+1...' form by stripping the prefix on both sides.
+    """
+    if not phone:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT hubspot_contact_id
+            FROM comm_events
+            WHERE REPLACE(from_number, 'whatsapp:', '') =
+                  REPLACE($1, 'whatsapp:', '')
+              AND hubspot_contact_id IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            phone,
+        )
+    return row["hubspot_contact_id"] if row else None
+
+
 async def _handle_http_error(
     broker: PostgresBroker,
     msg: BrokerMessage,
@@ -207,15 +251,22 @@ async def process_message(
     http_client: httpx.AsyncClient,
     msg: BrokerMessage,
     pool,
+    rate_limiter: TokenBucket | None = None,
 ) -> None:
     """
-    Deliver one enriched event to HubSpot. Two-step flow:
+    Deliver one enriched event to HubSpot. Three-step flow:
 
-      Phase 1 — Resolve contact:
-        If hubspot_contact_id is already set (from a prior partial attempt),
-        skip straight to Phase 2. Otherwise, search HubSpot by phone number
-        and create a contact if none is found. Persist the contact ID to the DB
-        immediately so retries never create duplicate contacts.
+      Phase 1a — Resolve contact ID:
+        If hubspot_contact_id is already set (retry path), use it.
+        Otherwise check our own DB first (consistent, avoids HubSpot search lag),
+        then fall back to HubSpot search-or-create. Persist the contact ID
+        immediately after creation so retries never create duplicate contacts.
+
+      Phase 1b — Fetch current ai_comm_log:
+        Always GET the live log from HubSpot right before building the PATCH
+        payload. This prevents the retry-path data-loss bug where existing_log
+        would stay "" and the PATCH would overwrite the entire history.
+        (Skipped only when find_or_create_contact already returned the log.)
 
       Phase 2 — Update contact:
         PATCH the contact with AI-generated properties (intent, sentiment,
@@ -248,12 +299,32 @@ async def process_message(
         log.error("delivery.max_attempts_exceeded", event_key=msg.event_key)
         return
 
+    # Client-side rate limit: one token per delivery covers search+create+get+patch
+    # as a single logical operation. Without this, a tight poll loop or crash-retry
+    # can burst well above HubSpot's daily quota. RateLimitExceededError nacks with
+    # a short backoff so the event re-enters the queue rather than being dropped.
+    if rate_limiter is not None:
+        try:
+            await rate_limiter.consume()
+        except RateLimitExceededError:
+            backoff = compute_backoff(msg.attempt_count)
+            reason = "HubSpot client-side rate limit exceeded — backing off"
+            await broker.nack(msg.id, reason, backoff)
+            log.warning(
+                "delivery.rate_limit_self_throttle",
+                backoff_seconds=backoff,
+                event_key=msg.event_key,
+            )
+            return
+
     t0 = time.monotonic()
 
-    # ── Phase 1: Resolve HubSpot contact ──────────────────────────────────────
+    # ── Phase 1a: Resolve HubSpot contact ID ──────────────────────────────────
 
     contact_id = msg.hubspot_contact_id
-    existing_log = ""
+    # True when we must GET the live log after resolving contact_id.
+    # False only when find_or_create_contact already returned it.
+    need_log_fetch = True
 
     if not contact_id:
         if not msg.from_number:
@@ -269,12 +340,67 @@ async def process_message(
             log.error("delivery.dead_lettered_no_phone", event_key=msg.event_key)
             return
 
+        # Check our own DB first — strongly consistent, avoids HubSpot search
+        # lag that creates duplicate contacts when two events from the same new
+        # caller arrive within seconds of each other.
+        contact_id = await _lookup_contact_id_by_phone(pool, msg.from_number)
+        if contact_id:
+            log.debug(
+                "delivery.contact_id_from_db",
+                contact_id=contact_id,
+                from_number=msg.from_number,
+            )
+            # Persist so the retry path uses it too.
+            await _persist_contact_id(pool, msg.id, contact_id)
+        else:
+            try:
+                contact_id, search_log = await find_or_create_contact(
+                    http_client,
+                    settings.HUBSPOT_PRIVATE_APP_TOKEN,
+                    settings.HUBSPOT_BASE_URL,
+                    msg.from_number,
+                )
+                # find_or_create_contact returns the log alongside the id.
+                # Use it directly to save a redundant GET.
+                existing_log = search_log
+                need_log_fetch = False
+            except httpx.HTTPStatusError as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                await _handle_http_error(broker, msg, pool, exc.response, latency_ms)
+                return
+            except httpx.RequestError as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                backoff = compute_backoff(msg.attempt_count)
+                error_type = type(exc).__name__
+                reason = f"{error_type}: {exc}"
+                await broker.nack(msg.id, reason, backoff)
+                await _write_delivery_log(
+                    pool, msg.id, msg.correlation_id, msg.attempt_count,
+                    status="failure", latency_ms=latency_ms, error_message=reason,
+                )
+                log.warning(
+                    "delivery.network_error_retry",
+                    error_type=error_type,
+                    backoff_seconds=backoff,
+                )
+                return
+
+            # Persist the contact ID immediately so retries skip creation.
+            await _persist_contact_id(pool, msg.id, contact_id)
+
+    # ── Phase 1b: Fetch current ai_comm_log ───────────────────────────────────
+    # Required for the retry path, the db-lookup path, and any path that did
+    # not call find_or_create_contact (which returned the log as a side-effect).
+    # Without this, existing_log stays "" and the PATCH would destroy history.
+
+    existing_log = ""
+    if need_log_fetch:
         try:
-            contact_id, existing_log = await find_or_create_contact(
+            existing_log = await get_contact_log(
                 http_client,
                 settings.HUBSPOT_PRIVATE_APP_TOKEN,
                 settings.HUBSPOT_BASE_URL,
-                msg.from_number,
+                contact_id,
             )
         except httpx.HTTPStatusError as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
@@ -296,9 +422,6 @@ async def process_message(
                 backoff_seconds=backoff,
             )
             return
-
-        # Persist the contact ID immediately so retries skip creation.
-        await _persist_contact_id(pool, msg.id, contact_id)
 
     # ── Phase 2: Update contact with AI properties ─────────────────────────────
 
@@ -355,7 +478,12 @@ async def process_message(
 # ── Poll loop ──────────────────────────────────────────────────────────────────
 
 
-async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient, pool) -> None:
+async def run_worker(
+    broker: PostgresBroker,
+    http_client: httpx.AsyncClient,
+    pool,
+    rate_limiter: TokenBucket,
+) -> None:
     """
     Main poll loop. Runs forever until a shutdown signal is received.
 
@@ -372,7 +500,7 @@ async def run_worker(broker: PostgresBroker, http_client: httpx.AsyncClient, poo
             if msg is None:
                 await asyncio.sleep(settings.DELIVERY_POLL_INTERVAL_SECONDS)
                 continue
-            await process_message(broker, http_client, msg, pool)
+            await process_message(broker, http_client, msg, pool, rate_limiter)
 
         except asyncio.CancelledError:
             log.info("delivery_worker.stopping")
@@ -394,6 +522,13 @@ async def main() -> None:
     pool = await create_pool()
     broker = PostgresBroker(pool=pool)
 
+    # Shared rate limiter — all deliveries draw from the same bucket.
+    # Keeps us well under HubSpot's daily quota even under retry storms.
+    hubspot_rate_limiter = TokenBucket(
+        capacity=settings.HUBSPOT_RATE_LIMIT_PER_MINUTE,
+        refill_rate=settings.HUBSPOT_RATE_LIMIT_PER_MINUTE / 60.0,
+    )
+
     async with httpx.AsyncClient() as http_client:
         # Create AI property group + custom fields in HubSpot once at startup.
         # Safe to re-run — 409 Conflict is silently ignored.
@@ -403,7 +538,7 @@ async def main() -> None:
             settings.HUBSPOT_BASE_URL,
         )
         try:
-            await run_worker(broker, http_client, pool)
+            await run_worker(broker, http_client, pool, hubspot_rate_limiter)
         finally:
             await pool.close()
             log.info("delivery_worker.stopped")

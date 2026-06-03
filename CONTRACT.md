@@ -1,9 +1,9 @@
 # Communication Layer — Versioned Event Contract
 
 **Schema Version:** `1.0`
-**Last Updated:** 2026-05-23
+**Last Updated:** 2026-06-03
 
-This document is the authoritative reference for every event the Communication Layer emits to downstream consumers. Treat it as a first-class deliverable — the "Azure team" (or any integration partner) consumes exactly this contract, not the underlying code.
+This document is the authoritative reference for every event the Communication Layer emits to downstream consumers (HubSpot CRM, Intelligence Layer, or any integration partner). Treat it as a first-class deliverable — consumers depend on this contract, not on the underlying code.
 
 ---
 
@@ -285,6 +285,25 @@ When the `to_number` is not in the number registry:
 2. **Check `schema_version`.** If you receive an unexpected version, reject the event and raise an alert rather than silently processing it incorrectly.
 3. **Thread `correlation_id` through your own logs.** This is the only way to trace an event end-to-end when something goes wrong.
 4. **Handle `source.is_unknown = true`.** Some events will arrive from numbers not in the registry. Your system must accept them.
+
+---
+
+## HubSpot Delivery (current production consumer)
+
+The delivery worker writes the following custom contact properties for each enriched `sms.received`, `whatsapp.received`, and `recording.ready` event:
+
+| HubSpot Property | Type | Description |
+|---|---|---|
+| `ai_last_intent` | `string` | Most recent call intent (e.g. `support_request`, `cancellation`) |
+| `ai_last_sentiment` | `string` | Most recent call sentiment (`positive`, `neutral`, `negative`) |
+| `ai_last_summary` | `string` | 1–3 sentence GPT-4o summary of the most recent conversation |
+| `ai_comm_log` | `string` (textarea) | Prepend-only log of all AI-enriched events, newest at top |
+
+Properties live in the **AI Insights** custom property group (created automatically on worker startup, idempotent — 409 Conflict is silently ignored).
+
+**Contact deduplication:** the delivery worker searches HubSpot by E.164 phone number before creating a contact. It also checks the local DB for a previously persisted `hubspot_contact_id` to avoid search-lag duplicates. A contact is created once and reused on every subsequent delivery for that number.
+
+**Deliverable event types only:** status callbacks (`sms.status`, `whatsapp.status`, `call.started`, `call.completed`) are persisted for audit but are never delivered to HubSpot — they are not enriched by GPT-4o and would sit pending forever under the enrichment gate.
 
 ---
 

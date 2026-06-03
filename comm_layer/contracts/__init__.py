@@ -3,7 +3,7 @@ Versioned event contract models.
 
 Every event type the Communication Layer emits is defined here as a Pydantic model.
 These models are the single source of truth for what consumers (the Delivery Worker,
-the Intelligence Layer, the mock Azure CRM) receive.
+the Intelligence Layer, and any integration partner) receive.
 
 Import from here, not from the individual modules:
     from comm_layer.contracts import SmsReceivedEvent, CallStartedEvent

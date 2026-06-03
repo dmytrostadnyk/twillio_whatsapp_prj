@@ -99,8 +99,8 @@ def make_voice_claim_row() -> dict:
 @pytest.mark.asyncio
 async def test_embedding_worker_sleeps_when_ai_disabled():
     """
-    When AI_ENABLED=False the worker must sleep and NEVER call claim_next.
-    We cancel after the first sleep call to exit the otherwise-infinite loop.
+    When the DB kill switch returns False, the worker must sleep and NEVER call
+    claim_next. We cancel after the first sleep call to exit the infinite loop.
     """
     mock_pool = MagicMock()
     sleep_calls = []
@@ -110,13 +110,13 @@ async def test_embedding_worker_sleeps_when_ai_disabled():
         raise asyncio.CancelledError
 
     with patch("intelligence_layer.embedding.settings") as mock_settings:
-        mock_settings.AI_ENABLED = False
         mock_settings.DELIVERY_POLL_INTERVAL_SECONDS = 5.0
 
-        with patch("intelligence_layer.embedding.claim_next_for_embedding") as mock_claim:
-            with patch("intelligence_layer.embedding.asyncio.sleep", side_effect=fake_sleep):
-                with pytest.raises(asyncio.CancelledError):
-                    await _embedding_worker(mock_pool, worker_id=0)
+        with patch("intelligence_layer.embedding.ai_enabled", AsyncMock(return_value=False)):
+            with patch("intelligence_layer.embedding.claim_next_for_embedding") as mock_claim:
+                with patch("intelligence_layer.embedding.asyncio.sleep", side_effect=fake_sleep):
+                    with pytest.raises(asyncio.CancelledError):
+                        await _embedding_worker(mock_pool, worker_id=0)
 
     assert len(sleep_calls) == 1
     mock_claim.assert_not_called()

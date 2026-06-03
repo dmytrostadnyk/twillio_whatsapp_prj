@@ -3,7 +3,7 @@ Status callback handlers — SMS, WhatsApp, Voice, and Voice Recording.
 
 Twilio fires these when the status of an outbound message or a call changes.
 Status callbacks follow the same fast-ack pattern as inbound webhooks:
-validate → persist → return 200. Never block on Azure or AI.
+validate → persist → return 200. Never block on AI.
 
 IMPORTANT: Status callbacks can arrive OUT OF ORDER.
 For example, you might receive 'delivered' before 'sent' for the same message.
@@ -27,11 +27,15 @@ RECORDING-READY CALLBACK:
 The recording callback fires ASYNCHRONOUSLY after the call ends — Twilio takes
 a few seconds to encode the audio. It is a separate HTTP POST from the call
 status callback and arrives at /webhooks/voice/recording.
+
+NOTE on transcription: this handler no longer spawns a background transcription
+task. Transcription is now handled by the intelligence layer enrichment worker,
+which inherits crash recovery via the enrichment lease (migration 0010). The
+webhook only persists the recording.ready event and returns 200 immediately.
 """
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Annotated
 
@@ -39,13 +43,11 @@ import asyncpg
 import structlog
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
-from supabase import AsyncClient
 
 from comm_layer.broker.base import Broker
 from comm_layer.contracts.base import EventSource
-from comm_layer.deps import get_broker, get_pool, get_supabase
+from comm_layer.deps import get_broker, get_pool
 from comm_layer.number_registry import resolve_source
-from comm_layer.transcription import transcribe_recording
 from comm_layer.twilio_security import require_twilio_signature
 from comm_layer.webhooks.ingest import ingest_event
 from comm_layer.webhooks.responses import EMPTY_TWIML
@@ -237,7 +239,6 @@ async def voice_recording_ready(
     form: Annotated[dict[str, str], Depends(require_twilio_signature)],
     pool: Annotated[asyncpg.Pool, Depends(get_pool)],
     broker: Annotated[Broker, Depends(get_broker)],
-    supabase: Annotated[AsyncClient, Depends(get_supabase)],
 ) -> Response:
     """
     Recording-ready callback — fires when Twilio finishes encoding a recording.
@@ -257,7 +258,7 @@ async def voice_recording_ready(
     every event in the chain has a fresh UUID and broken caller attribution.
 
     WHY we ingest 'failed' as its own event:
-    completed → audio is ready, transcribe it.
+    completed → audio is ready; intelligence worker will transcribe + enrich it.
     failed    → Twilio's encoder broke. Audio is gone but we still want a
                 durable record so ops can investigate and the dashboard can
                 show the loss. Captured as event_type='recording.failed'.
@@ -335,18 +336,9 @@ async def voice_recording_ready(
         correlation_id=correlation_id,
     )
 
-    # Fire batch transcription as a background task so the webhook returns
-    # immediately (fast-ack). Only triggered for completed recordings when we
-    # have a call_event_id to link the transcript to via FK. If call_ctx is
-    # None (fallback path), we skip transcription rather than violate the FK.
-    if recording_status == "completed" and call_ctx is not None:
-        asyncio.create_task(
-            transcribe_recording(
-                supabase=supabase,
-                call_event_id=call_ctx["id"],
-                recording_url=form.get("RecordingUrl", ""),
-                recording_sid=recording_sid,
-            )
-        )
+    # Transcription is now handled by the intelligence layer enrichment worker.
+    # The worker claims recording.ready and runs Whisper inline before GPT-4o,
+    # inheriting the enrichment lease for crash recovery (migration 0010).
+    # Nothing to do here — fast-ack complete.
 
     return Response(content=EMPTY_TWIML, media_type="application/xml")

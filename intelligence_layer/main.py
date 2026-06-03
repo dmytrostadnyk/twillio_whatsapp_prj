@@ -17,8 +17,9 @@ Reliability model:
   failure inside one pipeline does NOT kill the other. Each consumer in turn
   isolates per-worker exceptions internally.
 - If a worker is SIGKILLed between claiming and completing, the corresponding
-  status field stays at 'processing'. No automatic stale-row reaper at this
-  scope — acceptable for portfolio use, but noted as a known limitation.
+  enrichment row stays at 'processing'. Migration 0010 adds a lease: the claim
+  query re-claims stale 'processing' rows after ENRICHMENT_LEASE_SECONDS so
+  events are not stuck forever.
 - AI kill switch: if AI_ENABLED=False, workers sleep without calling any AI
   provider. Flip the env var to resume without restarting the process.
 """

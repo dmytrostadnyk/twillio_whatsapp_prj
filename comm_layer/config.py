@@ -57,8 +57,11 @@ class Settings(BaseSettings):
     # Base URL for all HubSpot API calls. Overridable in tests.
     HUBSPOT_BASE_URL: str = "https://api.hubapi.com"
 
-    # ── AI kill switch ──────────────────────────────────────────────────────────
-    # Set to False to instantly halt ALL AI calls without restarting the service.
+    # ── AI kill switch (env-var seed only) ─────────────────────────────────────
+    # This env-var seeds the app_settings.ai_enabled DB flag (migration 0011).
+    # At runtime, all AI checks read from the DB (comm_layer.db.ai_enabled).
+    # Changing this env-var alone requires a process restart; use the DB flag
+    # for live toggles without restart.
     AI_ENABLED: bool = True
 
     # ── Delivery worker tuning ──────────────────────────────────────────────────
@@ -66,7 +69,7 @@ class Settings(BaseSettings):
     DELIVERY_BACKOFF_BASE_SECONDS: float = 5.0
     # Cap on how long any single backoff can be. Without this, attempt counts
     # in the double digits would compute multi-hour delays. 5 minutes is long
-    # enough to let Azure recover but short enough to keep the queue moving.
+    # enough to let HubSpot recover but short enough to keep the queue moving.
     DELIVERY_BACKOFF_MAX_SECONDS: float = 300.0
     DELIVERY_POLL_INTERVAL_SECONDS: float = 5.0
     # How long a claimed row is hidden from other workers while being processed.
@@ -74,9 +77,18 @@ class Settings(BaseSettings):
     # after this many seconds. Must be well above the expected processing time.
     DELIVERY_LEASE_SECONDS: int = 60
 
+    # ── HubSpot rate limiting ────────────────────────────────────────────────────
+    # Client-side throttle so we never accidentally burst into HubSpot's limits.
+    # HubSpot free tier allows ~110 requests/10s with daily caps — stay well under.
+    HUBSPOT_RATE_LIMIT_PER_MINUTE: int = 100
+
     # ── Rate limiting ───────────────────────────────────────────────────────────
     ENRICHMENT_CONCURRENCY: int = 3
     OUTBOUND_RATE_LIMIT_PER_MINUTE: int = 5
+    # How long an enrichments row may stay 'processing' before another worker
+    # re-claims it. Must exceed worst-case GPT-4o latency incl. retries (~30s).
+    # A crashed worker leaves 'processing' rows; the lease bounds the silence gap.
+    ENRICHMENT_LEASE_SECONDS: int = 120
 
     # ── Embeddings + semantic search (Phase 8) ──────────────────────────────────
     # Number of concurrent embedding workers (background consumer). Each worker

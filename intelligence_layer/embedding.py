@@ -26,6 +26,7 @@ import structlog
 from openai import OpenAI
 
 from comm_layer.config import settings
+from comm_layer.db import ai_enabled
 
 log = structlog.get_logger()
 
@@ -206,7 +207,7 @@ async def _embedding_worker(pool, worker_id: int) -> None:
 
     while True:
         try:
-            if not settings.AI_ENABLED:
+            if not await ai_enabled(pool):
                 await asyncio.sleep(settings.DELIVERY_POLL_INTERVAL_SECONDS)
                 continue
 

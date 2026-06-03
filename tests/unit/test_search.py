@@ -67,17 +67,17 @@ def make_rerank_response(indices_and_scores: list[tuple[int, float]]) -> SimpleN
 
 @pytest.mark.asyncio
 async def test_search_returns_empty_when_ai_disabled():
-    """AI_ENABLED=False → instant [] return. No OpenAI, no DB, no Cohere."""
+    """DB kill switch returns False → instant [] return. No OpenAI, no Cohere."""
     mock_pool = make_mock_pool_with_rows([])
 
     with patch("intelligence_layer.search.settings") as mock_settings:
-        mock_settings.AI_ENABLED = False
         mock_settings.SEARCH_DEFAULT_LIMIT = 10
         mock_settings.SEARCH_CANDIDATE_POOL = 20
 
-        with patch("intelligence_layer.search.OpenAI") as mock_openai_cls:
-            with patch("intelligence_layer.search.cohere.Client") as mock_cohere_cls:
-                results = await search_events(mock_pool, "anything")
+        with patch("intelligence_layer.search.ai_enabled", AsyncMock(return_value=False)):
+            with patch("intelligence_layer.search.OpenAI") as mock_openai_cls:
+                with patch("intelligence_layer.search.cohere.Client") as mock_cohere_cls:
+                    results = await search_events(mock_pool, "anything")
 
     assert results == []
     mock_openai_cls.assert_not_called()

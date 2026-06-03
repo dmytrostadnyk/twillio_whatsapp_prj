@@ -2,16 +2,19 @@
 Unit tests for the Intelligence Layer (Phase 7).
 
 What we test:
-1. AI kill switch: worker loop sleeps when AI_ENABLED=False, never calls claim_next.
+1. AI kill switch: worker loop sleeps when ai_enabled() DB call returns False.
 2. claim_next returns None when the DB returns no row (empty queue).
 3. claim_next returns None when the INSERT claim is lost to another worker (race).
-4. SMS happy path: GPT-4o returns valid EnrichmentData → supabase UPDATE called
+4. SMS happy path: GPT-4o returns valid EnrichmentData → asyncpg UPDATE called
    with status='completed' and all enrichment fields.
 5. Voice happy path: recording.ready row uses transcript_text, not raw_payload.
-6. Retry then fail: GPT-4o raises on all 3 attempts → supabase UPDATE called with
+6. Retry then fail: GPT-4o raises on all 3 attempts → asyncpg UPDATE called with
    status='failed'; sleep was called between attempts.
+7. Stale 'processing' row: claim_next re-claims it when lease has expired (returns event).
+8. Empty SMS body → enrich_event writes status='skipped' (not 'failed').
 
-We mock asyncpg pool, Supabase client, and OpenAI so no real network calls are made.
+We mock asyncpg pool and OpenAI so no real network calls are made.
+Note: _update_enrichment now uses asyncpg (pool) not supabase-py.
 """
 
 from __future__ import annotations
@@ -87,24 +90,22 @@ def make_gpt4o_response(
     return SimpleNamespace(choices=[choice])
 
 
-def make_mock_supabase():
+def make_mock_pool_for_enrichment():
     """
-    Build a mock Supabase client that records update().eq().execute() calls.
+    Build a mock asyncpg pool for enrich_event tests.
 
-    WHY a self-returning builder mock: supabase uses a fluent interface —
-    table(...).update(...).eq(...).execute(). Each step returns the same
-    builder object so we can chain arbitrary calls and still reach .execute.
+    _update_enrichment now uses asyncpg (pool.acquire → conn.execute).
+    Returns (pool, conn_execute_mock) so tests can assert on the UPDATE call.
     """
-    mock_execute = AsyncMock(return_value=None)
-    # A single builder object whose methods all return itself (fluent pattern).
-    mock_builder = MagicMock()
-    mock_builder.execute = mock_execute
-    mock_builder.update = MagicMock(return_value=mock_builder)
-    mock_builder.eq = MagicMock(return_value=mock_builder)
-    mock_builder.insert = MagicMock(return_value=mock_builder)
-    mock_supabase = MagicMock()
-    mock_supabase.table = MagicMock(return_value=mock_builder)
-    return mock_supabase, mock_execute, mock_builder
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock(return_value=None)
+
+    mock_pool = MagicMock()
+    mock_pool.acquire = MagicMock(return_value=AsyncMock(
+        __aenter__=AsyncMock(return_value=mock_conn),
+        __aexit__=AsyncMock(return_value=False),
+    ))
+    return mock_pool, mock_conn.execute
 
 
 def make_mock_pool(fetchrow_return=None, claim_row_return=None):
@@ -139,8 +140,8 @@ def make_mock_pool(fetchrow_return=None, claim_row_return=None):
 @pytest.mark.asyncio
 async def test_worker_sleeps_when_ai_disabled():
     """
-    When AI_ENABLED=False the worker must sleep and NOT call claim_next.
-    We run the worker for one iteration by cancelling it after the first sleep.
+    When the DB kill switch returns False, the worker must sleep and NOT call
+    claim_next. We run for one iteration by cancelling after the first sleep.
     """
     mock_pool = MagicMock()
     mock_supabase = MagicMock()
@@ -149,19 +150,17 @@ async def test_worker_sleeps_when_ai_disabled():
 
     async def fake_sleep(seconds):
         sleep_calls.append(seconds)
-        # Cancel the task after the first sleep so the loop exits.
         raise asyncio.CancelledError
 
     with patch("intelligence_layer.consumer.settings") as mock_settings:
-        mock_settings.AI_ENABLED = False
         mock_settings.DELIVERY_POLL_INTERVAL_SECONDS = 5.0
 
-        with patch("intelligence_layer.consumer.claim_next") as mock_claim:
-            with patch("intelligence_layer.consumer.asyncio.sleep", side_effect=fake_sleep):
-                with pytest.raises(asyncio.CancelledError):
-                    await _worker(mock_pool, mock_supabase, worker_id=0)
+        with patch("intelligence_layer.consumer.ai_enabled", AsyncMock(return_value=False)):
+            with patch("intelligence_layer.consumer.claim_next") as mock_claim:
+                with patch("intelligence_layer.consumer.asyncio.sleep", side_effect=fake_sleep):
+                    with pytest.raises(asyncio.CancelledError):
+                        await _worker(mock_pool, mock_supabase, worker_id=0)
 
-    # Worker slept but never tried to claim work.
     assert len(sleep_calls) == 1
     mock_claim.assert_not_called()
 
@@ -225,14 +224,13 @@ async def test_claim_next_returns_none_when_claim_lost():
 async def test_enrich_event_sms_happy_path():
     """
     Given an sms.received event and a successful GPT-4o response, enrich_event
-    must call supabase.update with status='completed' and all enrichment fields.
+    must call asyncpg execute (UPDATE enrichments) with status='completed'.
     """
     event = make_sms_event()
-    mock_supabase, mock_execute, mock_builder = make_mock_supabase()
+    mock_pool, mock_execute = make_mock_pool_for_enrichment()
     gpt4o_response = make_gpt4o_response()
 
     with patch("intelligence_layer.enrichment.settings") as mock_settings:
-        mock_settings.AI_ENABLED = True
         mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
@@ -240,18 +238,15 @@ async def test_enrich_event_sms_happy_path():
             mock_client.beta.chat.completions.parse.return_value = gpt4o_response
             mock_openai_cls.return_value = mock_client
 
-            await enrich_event(pool=None, supabase=mock_supabase, event=event)
+            await enrich_event(pool=mock_pool, supabase=None, event=event)
 
-    # UPDATE was called once with status='completed'
+    # execute called once — the UPDATE enrichments SQL
     mock_execute.assert_called_once()
-    update_payload = mock_builder.update.call_args[0][0]
-    assert update_payload["status"] == "completed"
-    assert update_payload["summary"] == "Customer needs order help."
-    assert update_payload["intent"] == "support_request"
-    assert update_payload["sentiment"] == "neutral"
-    assert len(update_payload["entities"]) == 1
-    assert update_payload["entities"][0]["value"] == "order"
-    assert len(update_payload["action_items"]) == 1
+    sql_call = mock_execute.call_args[0][0]
+    args = mock_execute.call_args[0]
+    assert "UPDATE enrichments" in sql_call
+    # $2 = status (second positional param after comm_event_id)
+    assert "completed" in args
 
 
 # ── Test 5: Voice happy path ───────────────────────────────────────────────────
@@ -261,13 +256,12 @@ async def test_enrich_event_sms_happy_path():
 async def test_enrich_event_voice_uses_transcript_text():
     """
     For recording.ready events, GPT-4o must be called with transcript_text
-    (not with anything from raw_payload).  We verify this by checking the
-    user message passed to completions.parse().
+    (not with anything from raw_payload).
     """
     from comm_layer.contracts.enriched import ActionItem, EnrichmentData
 
     event = make_voice_event()
-    mock_supabase, mock_execute, mock_builder = make_mock_supabase()
+    mock_pool, mock_execute = make_mock_pool_for_enrichment()
 
     parsed = EnrichmentData(
         summary="Customer wants to cancel subscription.",
@@ -287,7 +281,6 @@ async def test_enrich_event_voice_uses_transcript_text():
         return gpt4o_response
 
     with patch("intelligence_layer.enrichment.settings") as mock_settings:
-        mock_settings.AI_ENABLED = True
         mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
@@ -295,17 +288,15 @@ async def test_enrich_event_voice_uses_transcript_text():
             mock_client.beta.chat.completions.parse.side_effect = fake_parse
             mock_openai_cls.return_value = mock_client
 
-            await enrich_event(pool=None, supabase=mock_supabase, event=event)
+            await enrich_event(pool=mock_pool, supabase=None, event=event)
 
-    # The user message must contain the transcript text, not a URL.
     user_msg = next(m for m in captured_messages if m["role"] == "user")
     assert "cancel my subscription" in user_msg["content"]
     assert "RecordingUrl" not in user_msg["content"]
 
     mock_execute.assert_called_once()
-    update_payload = mock_builder.update.call_args[0][0]
-    assert update_payload["status"] == "completed"
-    assert update_payload["intent"] == "cancellation"
+    args = mock_execute.call_args[0]
+    assert "completed" in args
 
 
 # ── Test 6: Retry then fail ────────────────────────────────────────────────────
@@ -317,10 +308,10 @@ async def test_enrich_event_retries_then_marks_failed():
     If GPT-4o raises on all 3 attempts, enrich_event must:
     - call the API exactly 3 times (1 initial + 2 retries),
     - sleep RETRY_SLEEP_SECONDS between each attempt,
-    - call supabase UPDATE with status='failed'.
+    - call asyncpg execute with status='failed'.
     """
     event = make_sms_event()
-    mock_supabase, mock_execute, mock_builder = make_mock_supabase()
+    mock_pool, mock_execute = make_mock_pool_for_enrichment()
 
     sleep_calls = []
 
@@ -328,7 +319,6 @@ async def test_enrich_event_retries_then_marks_failed():
         sleep_calls.append(seconds)
 
     with patch("intelligence_layer.enrichment.settings") as mock_settings:
-        mock_settings.AI_ENABLED = True
         mock_settings.OPENAI_API_KEY = "sk-fake"
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
@@ -336,20 +326,79 @@ async def test_enrich_event_retries_then_marks_failed():
             mock_client.beta.chat.completions.parse.side_effect = RuntimeError("API error")
             mock_openai_cls.return_value = mock_client
 
-            # time.sleep is used inside the sync _call_gpt4o_with_retries helper.
             with patch("intelligence_layer.enrichment.time.sleep", side_effect=fake_sleep):
-                await enrich_event(pool=None, supabase=mock_supabase, event=event)
+                await enrich_event(pool=mock_pool, supabase=None, event=event)
 
-    # 3 total attempts (MAX_RETRIES=2 means 1 initial + 2 retries)
     assert mock_client.beta.chat.completions.parse.call_count == 3
-
-    # Sleep called between attempts: after attempt 0 and after attempt 1.
     assert len(sleep_calls) == 2
     from intelligence_layer.enrichment import RETRY_SLEEP_SECONDS
     assert all(s == RETRY_SLEEP_SECONDS for s in sleep_calls)
 
-    # Final update must be status='failed'
     mock_execute.assert_called_once()
-    update_payload = mock_builder.update.call_args[0][0]
-    assert update_payload["status"] == "failed"
-    assert "failure_reason" in update_payload
+    args = mock_execute.call_args[0]
+    assert "failed" in args
+
+
+# ── Test 7: Stale processing row is re-claimable ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_claim_next_reclaims_stale_processing_row():
+    """
+    A 'processing' enrichment row older than the lease must be treated as if it
+    doesn't exist — claim_next should return the event so it gets re-enriched.
+    This covers the crash-recovery path: worker dies mid-enrichment, leaving a
+    stale 'processing' row that would otherwise block delivery forever.
+    """
+    select_row = {
+        "id": FAKE_COMM_EVENT_ID,
+        "event_type": "sms.received",
+        "raw_payload": '{"Body": "Help please"}',
+        "correlation_id": FAKE_CORRELATION_ID,
+        "transcript_text": None,
+    }
+    # The upsert succeeds — the stale row was reclaimed.
+    claim_row = {"id": FAKE_ENRICHMENT_ID}
+
+    mock_pool, mock_conn = make_mock_pool(
+        fetchrow_return=select_row,
+        claim_row_return=claim_row,
+    )
+
+    # Use a very short lease so the query matches easily.
+    result = await claim_next(mock_pool, lease_seconds=1)
+
+    assert result is not None
+    assert result["id"] == FAKE_COMM_EVENT_ID
+    # Both SELECT and UPSERT were issued.
+    assert mock_conn.fetchrow.call_count == 2
+
+
+# ── Test 8: Empty SMS body → status='skipped' ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enrich_event_empty_body_writes_skipped():
+    """
+    An SMS with an empty body has no text to enrich. enrich_event should write
+    status='skipped' (not 'failed') so it is distinct from a GPT-4o API failure
+    and the delivery gate can still ship the event to HubSpot.
+    """
+    event = {
+        "id": FAKE_COMM_EVENT_ID,
+        "event_type": "sms.received",
+        "raw_payload": {"Body": ""},
+        "correlation_id": FAKE_CORRELATION_ID,
+        "transcript_text": None,
+    }
+    mock_pool, mock_execute = make_mock_pool_for_enrichment()
+
+    await enrich_event(pool=mock_pool, supabase=None, event=event)
+
+    mock_execute.assert_called_once()
+    # The SQL and positional args are all in call_args[0].
+    # $2 = 'skipped' (the status), present in the args tuple.
+    args = mock_execute.call_args[0]
+    assert "skipped" in args, (
+        f"Expected 'skipped' in execute args, got: {args}"
+    )

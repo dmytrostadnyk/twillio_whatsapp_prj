@@ -6,7 +6,7 @@ WHY Postgres instead of Redis/Kafka:
 - SELECT FOR UPDATE SKIP LOCKED gives us atomic claiming without a separate service.
 - Events are durable (survives restarts) without any extra config.
 - The table IS the audit trail — no separate logging needed.
-- Easy to swap for Azure Service Bus later (see AzureServiceBusBroker stub).
+- Easy to swap for Azure Service Bus later (see azure_servicebus.py stub).
 
 The critical SQL pattern:
     SELECT ... FROM comm_events

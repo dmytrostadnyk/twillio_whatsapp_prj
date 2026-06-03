@@ -4,7 +4,8 @@ Broker abstract base class.
 WHY an ABC (abstract base class): every method here represents a contract that
 both PostgresBroker and AzureServiceBusBroker must honour. The delivery worker
 and intelligence layer depend only on this interface — they never import a
-concrete implementation directly. This is what makes the Azure swap config-only.
+concrete implementation directly. This is what makes swapping broker backends
+a config-only change.
 
 The five operations a broker must support:
 - publish:     record that an event is ready to be delivered
@@ -64,7 +65,7 @@ class Broker(ABC):
     Abstract broker interface.
 
     All methods are async because both PostgresBroker (asyncpg) and a real
-    Azure Service Bus client use async I/O.
+    Azure Service Bus broker client use async I/O.
     """
 
     @abstractmethod
@@ -88,7 +89,7 @@ class Broker(ABC):
 
         WHY atomic: if two worker processes both poll simultaneously, only one
         must receive each message. PostgresBroker uses SELECT FOR UPDATE SKIP LOCKED
-        to guarantee this. The Azure implementation uses message locking.
+        to guarantee this. An Azure Service Bus implementation uses message locking.
         """
         ...
 
@@ -100,7 +101,7 @@ class Broker(ABC):
         Mark an event as successfully delivered.
 
         If contract_payload is provided, it is written to comm_events.contract_payload
-        so there is an immutable record of exactly what was sent to the consumer.
+        so there is an immutable record of exactly what was delivered.
         """
         ...
 

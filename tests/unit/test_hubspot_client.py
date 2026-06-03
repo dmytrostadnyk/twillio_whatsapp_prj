@@ -11,6 +11,9 @@ What we test:
 7.  normalize_phone strips whatsapp prefix
 8.  normalize_phone leaves plain E.164 unchanged
 9.  normalize_phone handles None
+10. get_contact_log returns ai_comm_log from a successful GET
+11. get_contact_log returns "" when ai_comm_log property is absent
+12. get_contact_log raises HTTPStatusError on non-2xx
 
 All HTTP calls are mocked with respx — no real HubSpot API is called.
 """
@@ -24,6 +27,7 @@ import respx
 from comm_layer.config import settings
 from delivery_worker.hubspot_client import (
     find_or_create_contact,
+    get_contact_log,
     normalize_phone,
 )
 
@@ -196,3 +200,57 @@ async def test_create_5xx_raises_http_status_error():
     async with httpx.AsyncClient() as client:
         with pytest.raises(httpx.HTTPStatusError):
             await find_or_create_contact(client, "fake-token", _BASE, "+15559876543")
+
+
+# ── get_contact_log ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_contact_log_returns_existing_log():
+    """GET contact by ID → returns the ai_comm_log property value."""
+    contact_id = "hs-789"
+    respx.get(f"{_BASE}/crm/v3/objects/contacts/{contact_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": contact_id, "properties": {"ai_comm_log": "Entry from last call"}},
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        log_value = await get_contact_log(client, "fake-token", _BASE, contact_id)
+
+    assert log_value == "Entry from last call"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_contact_log_returns_empty_string_when_property_absent():
+    """If ai_comm_log is not in properties (new contact), return "" not None."""
+    contact_id = "hs-789"
+    respx.get(f"{_BASE}/crm/v3/objects/contacts/{contact_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": contact_id, "properties": {}},
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        log_value = await get_contact_log(client, "fake-token", _BASE, contact_id)
+
+    assert log_value == ""
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_contact_log_raises_on_non_2xx():
+    """
+    A 5xx or 4xx from the GET endpoint raises HTTPStatusError.
+    The delivery worker catches this and nacks so we never proceed to a
+    PATCH that would overwrite history with an empty log.
+    """
+    contact_id = "hs-789"
+    respx.get(f"{_BASE}/crm/v3/objects/contacts/{contact_id}").mock(
+        return_value=httpx.Response(500)
+    )
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await get_contact_log(client, "fake-token", _BASE, contact_id)

@@ -76,6 +76,31 @@ async def create_pool() -> asyncpg.Pool:
     return pool
 
 
+async def ai_enabled(pool: asyncpg.Pool) -> bool:
+    """
+    Read the ai_enabled flag from the app_settings table (migration 0011).
+
+    WHY DB-backed and not settings.AI_ENABLED:
+    settings is an lru_cache singleton frozen at import time — changing the env
+    var has no effect until a process restart. The DB flag can be toggled live
+    with a single UPDATE and takes effect on the next poll-loop iteration.
+
+    WHY no in-process cache here:
+    Each caller (enrichment worker, embedding worker, search) polls on its own
+    schedule. The DB query is cheap (single row, primary key lookup). If you need
+    sub-millisecond reads, add a short TTL cache at the call site — do not add
+    global mutable state here.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT ai_enabled FROM app_settings WHERE id = 1")
+    if row is None:
+        # Row missing means migration 0011 hasn't run yet — default to True so
+        # existing deployments that haven't run the migration don't break.
+        log.warning("db.app_settings_missing_defaulting_ai_enabled_true")
+        return True
+    return bool(row["ai_enabled"])
+
+
 async def create_supabase_client() -> AsyncClient:
     """
     Create the Supabase async client.

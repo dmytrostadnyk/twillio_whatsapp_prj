@@ -28,6 +28,7 @@ import structlog
 from openai import OpenAI
 
 from comm_layer.config import settings
+from comm_layer.db import ai_enabled
 
 log = structlog.get_logger()
 
@@ -73,7 +74,7 @@ async def search_events(
     limit = limit or settings.SEARCH_DEFAULT_LIMIT
     candidate_pool = candidate_pool or settings.SEARCH_CANDIDATE_POOL
 
-    if not settings.AI_ENABLED:
+    if not await ai_enabled(pool):
         log.info("search.skipped_ai_disabled")
         return []
 

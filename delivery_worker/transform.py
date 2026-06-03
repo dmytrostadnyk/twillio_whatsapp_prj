@@ -28,10 +28,11 @@ def build_hubspot_properties(msg: BrokerMessage, existing_log: str = "") -> dict
     HubSpot's PATCH API ignores null values, but some property types reject them.
     Empty string is always safe and renders cleanly in the HubSpot UI.
 
-    Known limitation: if process_message crashes between the PATCH and the ack,
-    a retry will append a second copy of this entry to the log. This is an
-    accepted trade-off for a single-worker deployment. The 'last_' fields are
-    always idempotent (same value overwritten).
+    Residual race: if two worker processes deliver two events for the same contact
+    at exactly the same instant, both may read the same existing_log and one
+    prepend can be lost. This is acceptable for single-worker deployments and very
+    unlikely in practice. The 'ai_last_*' fields are always idempotent (same value
+    overwritten on retry).
     """
     timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M UTC")
     # e.g. "Inbound SMS", "Inbound Voice", "Inbound WhatsApp"

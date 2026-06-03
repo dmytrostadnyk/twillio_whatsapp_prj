@@ -1,1 +1,1 @@
-"""Delivery Worker — polls the broker and ships events to mock Azure. Implemented in Phase 2."""
+"""Delivery Worker — polls the broker and ships enriched events to HubSpot CRM."""

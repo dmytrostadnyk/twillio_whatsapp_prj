@@ -1,5 +1,5 @@
 -- Migration 0006: Delivery log (append-only audit trail)
--- Every attempt to deliver an event to Azure is recorded here.
+-- Every attempt to deliver an event to the downstream consumer (HubSpot) is recorded here.
 -- This is intentionally append-only — we never update or delete rows.
 -- The dashboard reads this to show the delivery timeline per event.
 
@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS delivery_log (
 
     attempt_number  INT NOT NULL,
     status          TEXT NOT NULL,                 -- 'success' | 'failure'
-    http_status     INT,                           -- HTTP response code from Azure, if any
+    http_status     INT,                           -- HTTP response code from the consumer, if any
     latency_ms      INT,                           -- round-trip time in milliseconds
     error_message   TEXT,                          -- null on success
 
