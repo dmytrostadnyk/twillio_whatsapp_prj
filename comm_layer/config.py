@@ -114,6 +114,40 @@ class Settings(BaseSettings):
     # ── Voice recording ─────────────────────────────────────────────────────────
     MAX_RECORDING_DURATION_SECONDS: int = 3600
 
+    # ── WhatsApp auto-reply ──────────────────────────────────────────────────────
+    # Master switch for the auto-reply chatbot. Set to False to stop replying
+    # without disabling AI enrichment (which uses the DB-backed ai_enabled flag).
+    WHATSAPP_AUTOREPLY_ENABLED: bool = True
+
+    # Enable / disable the prompt-injection classifier guard (Layer 2).
+    # Disable only in tests or to save cost on a zero-risk internal deployment.
+    WHATSAPP_INJECTION_GUARD_ENABLED: bool = True
+
+    # Model used by the prompt-injection classifier. GPT-4o-mini is cheap (~$0.0001
+    # per screen) and fast enough for the secondary guard. Never use GPT-4o here —
+    # the guard must be cheaper than the thing it protects.
+    WHATSAPP_GUARD_MODEL: str = "gpt-4o-mini"
+
+    # How long a claimed 'processing' reply row can stay in-flight before another
+    # worker re-claims it (same lease pattern as ENRICHMENT_LEASE_SECONDS).
+    # Must exceed worst-case GPT-4o + Twilio round-trip time (well under 30s).
+    WHATSAPP_REPLY_LEASE_SECONDS: int = 120
+
+    # Number of concurrent reply workers. Default 1 so messages from the same contact
+    # are never answered in parallel (ordering risk). Increase only for high volume.
+    WHATSAPP_REPLY_CONCURRENCY: int = 1
+
+    # How many prior conversation turns to include in the GPT-4o context window
+    # for multi-turn memory. Each turn = one inbound message + one reply (if any).
+    WHATSAPP_REPLY_HISTORY_LIMIT: int = 10
+
+    # Path to the markdown file describing the business (products, hours, policies).
+    # Loaded once at worker startup and injected into every reply's system prompt.
+    # You can edit this file without restarting the process — it's read at startup.
+    BUSINESS_CONTEXT_PATH: str = str(
+        Path(__file__).parent.parent / "intelligence_layer" / "business_context.md"
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

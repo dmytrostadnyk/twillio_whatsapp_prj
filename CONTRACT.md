@@ -307,8 +307,49 @@ Properties live in the **AI Insights** custom property group (created automatica
 
 ---
 
+## WhatsApp Auto-Reply (intelligence layer)
+
+The intelligence layer sends an AI-generated reply for every `whatsapp.received`
+event via Twilio. This is tracked in the `whatsapp_replies` table (migration 0012).
+
+**At-most-once guarantee:** the worker flips to `status='sending'` immediately before
+calling the Twilio API. If the process crashes after that, the stale `sending` row is
+swept to `status='failed'` on restart rather than being re-sent. This prevents
+double-texting the customer at the cost of occasionally missing a reply after a crash.
+
+**Prompt-injection defense (four layers):**
+1. Structural: customer text is always placed in `role="user"` turns, never spliced
+   into the system prompt string.
+2. Input screening: a heuristic pass escalates to a GPT-4o-mini classifier that
+   returns `safe | injection | jailbreak | off_topic_abuse`. On anything except
+   `safe`, the `SAFE_FALLBACK_REPLY` is sent and generation is skipped.
+3. Output canary: a random token embedded in the system prompt; if it appears in the
+   generated reply, the reply is blocked and the fallback is sent instead.
+4. Capability minimisation: the reply bot has no tools, no DB writes, no external
+   actions. Even a successful injection can only produce bad text — it cannot
+   exfiltrate data or take actions.
+
+**Multi-turn memory:** the worker loads the last `WHATSAPP_REPLY_HISTORY_LIMIT` (default
+10) message/reply pairs for the sending phone number and builds a multi-turn GPT-4o
+conversation so follow-up questions work correctly.
+
+**Kill switches:**
+- `UPDATE app_settings SET ai_enabled = false;` — halts all AI work (enrichment,
+  embedding, and reply) without a process restart.
+- `WHATSAPP_AUTOREPLY_ENABLED=false` env var — halts only the reply consumer without
+  affecting enrichment or embedding.
+
+**Business context:** replies are grounded in `intelligence_layer/business_context.md`
+(the imaginary NovaBrew Coffee shop). Edit this file and restart the worker to update
+the knowledge base. RAG over a document corpus is a deliberately-deferred "v2" — the
+entire knowledge base fits in the context window, so retrieval would add operational
+complexity with no quality gain.
+
+---
+
 ## Changelog
 
 | Date | Version | Change |
 |---|---|---|
 | 2026-05-23 | 1.0 | Initial contract — Voice, SMS, WhatsApp, and Enriched event types |
+| 2026-06-03 | 1.0 | Added WhatsApp auto-reply section (migration 0012, prompt-guard, business context) |
