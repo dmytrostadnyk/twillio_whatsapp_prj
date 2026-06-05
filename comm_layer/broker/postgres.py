@@ -78,6 +78,14 @@ class PostgresBroker(Broker):
         stay invisible to the delivery worker until the intelligence layer finishes
         (or gives up). FOR UPDATE OF ce locks only comm_events — not enrichments —
         so the enrichment worker is never blocked by the delivery worker.
+
+        WHY the extra LEFT JOIN whatsapp_replies condition:
+        For WhatsApp events the delivery worker needs to know whether the bot
+        could answer (wr.resolved) before it can decide whether to inject a
+        follow-up action item in HubSpot. We gate on the reply reaching a
+        terminal status so the resolved flag is always set before delivery.
+        SMS and voice events are unaffected (LEFT JOIN returns NULL → first OR
+        branch is true → they pass the gate immediately).
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -89,13 +97,22 @@ class PostgresBroker(Broker):
                            ce.source_metadata, ce.raw_payload,
                            ce.attempt_count, ce.created_at,
                            ce.hubspot_contact_id,
+                           ce.hubspot_note_id,
+                           ce.hubspot_ticket_id,
+                           ce.hubspot_task_id,
                            e.summary, e.intent, e.sentiment,
-                           e.entities, e.action_items
+                           e.entities, e.action_items,
+                           wr.resolved AS reply_resolved
                     FROM comm_events ce
                     INNER JOIN enrichments e ON e.comm_event_id = ce.id
+                    LEFT JOIN whatsapp_replies wr ON wr.comm_event_id = ce.id
                     WHERE ce.delivery_status IN ('pending', 'failed')
                       AND (ce.next_retry_at IS NULL OR ce.next_retry_at <= NOW())
                       AND e.status IN ('completed', 'failed', 'skipped')
+                      AND (
+                          ce.event_type <> 'whatsapp.received'
+                          OR wr.status IN ('sent', 'skipped', 'failed')
+                      )
                     ORDER BY ce.created_at
                     LIMIT 1
                     FOR UPDATE OF ce SKIP LOCKED
@@ -138,6 +155,10 @@ class PostgresBroker(Broker):
                     entities=row["entities"] if row["entities"] is not None else [],
                     action_items=row["action_items"] if row["action_items"] is not None else [],
                     hubspot_contact_id=row["hubspot_contact_id"],
+                    hubspot_note_id=row["hubspot_note_id"],
+                    hubspot_ticket_id=row["hubspot_ticket_id"],
+                    hubspot_task_id=row["hubspot_task_id"],
+                    reply_resolved=row["reply_resolved"],
                 )
 
         log.debug(

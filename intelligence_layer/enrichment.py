@@ -57,8 +57,15 @@ Rules:
 - sentiment: exactly one of positive, neutral, negative.
 - entities: only meaningful nouns (products, people, dates, amounts).
   Skip filler. Empty list is fine.
-- action_items: only concrete next steps the operator should take.
-  Empty list is fine. Priority is one of high, medium, low.
+- action_items: concrete next steps the operator should take. Priority is one of high, medium, low.
+  Channel rules:
+    sms.received      — always add at least one action item (e.g. "Reply to customer via SMS")
+                        because SMS has no auto-reply; every inbound message needs a human response.
+    whatsapp.received — only add action items when human escalation is genuinely needed
+                        (e.g. complaints, billing disputes, requests the chatbot cannot resolve).
+                        Routine questions answered by the chatbot need no action item.
+    recording.ready   — add action items based on what the caller needs (follow-up call,
+                        refund, escalation, etc.).
 - Output ONLY the structured fields. No prose outside them.\
 """
 

@@ -58,6 +58,14 @@ class BrokerMessage:
     action_items: list | None = None
     # Set after a successful HubSpot contact find-or-create so retries skip it.
     hubspot_contact_id: str | None = None
+    # Set after a Note is created on the contact timeline — retries skip creation.
+    hubspot_note_id: str | None = None
+    # Set after a Ticket is created for complaint/negative events — retries skip it.
+    hubspot_ticket_id: str | None = None
+    # True/False = WhatsApp bot answered / couldn't answer. None = not a WhatsApp event.
+    reply_resolved: bool | None = None
+    # Set after a real HubSpot Task is created for bot-can't-answer events — retries skip it.
+    hubspot_task_id: str | None = None
 
 
 class Broker(ABC):

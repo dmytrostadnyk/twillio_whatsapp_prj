@@ -13,6 +13,7 @@ the checkbox off has up to 10s lag. Acceptable for a portfolio demo.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pandas as pd
@@ -44,7 +45,7 @@ def _fetch_events() -> list[dict]:
             "id, event_key, channel, direction, event_type, "
             "from_number, to_number, delivery_status, attempt_count, created_at, "
             "enrichments(summary, intent, sentiment, action_items, status, failure_reason)"
-        ).order("created_at", desc=True).limit(100).execute()
+        ).eq("direction", "inbound").order("created_at", desc=True).limit(100).execute()
         return result.data or []
     except Exception as exc:
         log.error("dashboard.feed.query_failed", error=str(exc))
@@ -129,12 +130,22 @@ def show() -> None:
                     if enrichment.get("summary"):
                         st.write("**Summary:**")
                         st.write(enrichment["summary"])
-                    action_items = enrichment.get("action_items") or []
+                    raw = enrichment.get("action_items") or []
+                    if isinstance(raw, str):
+                        try:
+                            raw = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
+                            raw = []
+                    action_items = raw if isinstance(raw, list) else []
                     if action_items:
                         st.write("**Action items:**")
                         for item in action_items:
-                            priority = item.get("priority", "")
-                            desc = item.get("description", str(item))
+                            if isinstance(item, dict):
+                                priority = item.get("priority", "")
+                                desc = item.get("description", str(item))
+                            else:
+                                desc = str(item)
+                                priority = ""
                             st.write(f"- [{priority}] {desc}")
                     if enrichment.get("status") == "failed":
                         st.warning(f"Enrichment failed: {enrichment.get('failure_reason')}")

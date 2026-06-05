@@ -6,7 +6,8 @@ NovaBrew Coffee is a specialty coffee roastery and café based in Vilnius, Lithu
 We source single-origin beans from Ethiopia, Colombia, and Guatemala, roast them
 in small batches every Tuesday and Friday, and ship across Europe within 2–5 business
 days. We also have a cozy walk-in café where you can enjoy freshly brewed coffee and
-light pastries.
+light pastries. Our team speaks Lithuanian, Russian, and English and we welcome
+customers in any language.
 
 ---
 

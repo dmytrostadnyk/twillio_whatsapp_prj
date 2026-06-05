@@ -64,6 +64,10 @@ def make_db_row(
         "entities": [],
         "action_items": [],
         "hubspot_contact_id": None,
+        "hubspot_note_id": None,
+        "hubspot_ticket_id": None,
+        "hubspot_task_id": None,
+        "reply_resolved": None,
     }
 
 

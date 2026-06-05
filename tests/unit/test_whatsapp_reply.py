@@ -31,6 +31,7 @@ from comm_layer.outbound import WindowExpiredError
 from intelligence_layer.prompt_guard import SAFE_FALLBACK_REPLY
 from intelligence_layer.whatsapp_reply import (
     _sweep_stale_sending,
+    _WhatsAppReply,
     claim_next,
     handle_reply,
 )
@@ -306,6 +307,7 @@ async def test_handle_reply_sent_on_happy_path():
     pool, mock_conn = make_execute_pool()
     event = make_event()
     generated_reply = "We are open Monday to Friday 8am to 7pm!"
+    structured_reply = _WhatsAppReply(reply_text=generated_reply, resolved=True)
 
     with (
         patch("intelligence_layer.whatsapp_reply.ai_enabled", AsyncMock(return_value=True)),
@@ -314,7 +316,7 @@ async def test_handle_reply_sent_on_happy_path():
         patch("intelligence_layer.whatsapp_reply._load_history", AsyncMock(return_value=[])),
         patch(
             "intelligence_layer.whatsapp_reply._generate_reply_with_retries",
-            return_value=generated_reply,
+            return_value=structured_reply,
         ),
         patch("intelligence_layer.whatsapp_reply.screen_output", return_value=generated_reply),
         patch("intelligence_layer.whatsapp_reply.send_whatsapp", AsyncMock(return_value=FAKE_SID)),
@@ -352,7 +354,7 @@ async def test_handle_reply_skipped_on_window_expired():
         patch("intelligence_layer.whatsapp_reply._load_history", AsyncMock(return_value=[])),
         patch(
             "intelligence_layer.whatsapp_reply._generate_reply_with_retries",
-            return_value="A reply",
+            return_value=_WhatsAppReply(reply_text="A reply", resolved=True),
         ),
         patch("intelligence_layer.whatsapp_reply.screen_output", return_value="A reply"),
         patch(
@@ -440,3 +442,39 @@ async def test_load_history_oldest_first():
     assert len(history) == 2
     assert history[0]["inbound_body"] == "What are your hours?"
     assert history[1]["inbound_body"] == "And on Sunday?"
+
+
+# ── Test 13: resolved=False persisted when bot couldn't answer ────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_reply_persists_resolved_false_when_bot_could_not_answer():
+    """
+    When GPT-4o returns resolved=False (bot deferred to email/staff), the 'sent'
+    DB write must include resolved=False so the delivery worker can inject a
+    follow-up action item in HubSpot.
+    """
+    pool, mock_conn = make_execute_pool()
+    event = make_event()
+    reply_text = "I'm sorry, I don't have details on that. Contact us at hello@novabrew.lt."
+    structured_reply = _WhatsAppReply(reply_text=reply_text, resolved=False)
+
+    with (
+        patch("intelligence_layer.whatsapp_reply.ai_enabled", AsyncMock(return_value=True)),
+        patch("intelligence_layer.whatsapp_reply._BUSINESS_CONTEXT", "shop info"),
+        patch("intelligence_layer.whatsapp_reply.screen_input", return_value=True),
+        patch("intelligence_layer.whatsapp_reply._load_history", AsyncMock(return_value=[])),
+        patch(
+            "intelligence_layer.whatsapp_reply._generate_reply_with_retries",
+            return_value=structured_reply,
+        ),
+        patch("intelligence_layer.whatsapp_reply.screen_output", return_value=reply_text),
+        patch("intelligence_layer.whatsapp_reply.send_whatsapp", AsyncMock(return_value=FAKE_SID)),
+    ):
+        await handle_reply(pool, MagicMock(), event)
+
+    # Two DB writes: 'sending' then 'sent'. The 'sent' write must include resolved=False.
+    assert mock_conn.execute.call_count == 2
+    sent_sql, *sent_params = mock_conn.execute.call_args_list[1].args
+    assert "sent" in sent_params, "Status must be 'sent'"
+    assert False in sent_params, "resolved=False must be persisted in the 'sent' write"

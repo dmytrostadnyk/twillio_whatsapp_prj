@@ -50,12 +50,39 @@ class Settings(BaseSettings):
 
     # ── HubSpot CRM ─────────────────────────────────────────────────────────────
     # Service Key token — required, no default. Fails loudly at startup if unset.
-    # Create at: HubSpot → Settings → Integrations → Service Keys.
+    # Create at: HubSpot → Settings → Integrations → Private Apps.
     # Required scopes: crm.objects.contacts.read, crm.objects.contacts.write,
-    #                  crm.schemas.contacts.write
+    #                  crm.schemas.contacts.write, crm.objects.tickets.write,
+    #                  crm.objects.tickets.read, crm.objects.tasks.write
     HUBSPOT_PRIVATE_APP_TOKEN: str
     # Base URL for all HubSpot API calls. Overridable in tests.
     HUBSPOT_BASE_URL: str = "https://api.hubapi.com"
+
+    # Write a native Note on the contact timeline for every communication event.
+    # Disable to keep properties-only mode (e.g. during migration or testing).
+    HUBSPOT_NOTES_ENABLED: bool = True
+
+    # Auto-create a Ticket for complaint intent or negative sentiment events.
+    # Requires crm.objects.tickets.write scope on the Private App.
+    HUBSPOT_TICKETS_ENABLED: bool = True
+
+    # HubSpot Service pipeline and first-stage IDs for auto-created Tickets.
+    # Defaults: "0" = default support pipeline, "1" = first open stage.
+    # Find your values in HubSpot → Settings → Objects → Tickets → Pipelines.
+    HUBSPOT_TICKET_PIPELINE: str = "0"
+    HUBSPOT_TICKET_PIPELINE_STAGE: str = "1"
+    # Stage id that means "Closed" in the support pipeline.
+    # Used to decide whether an existing ticket can be reused (open) or a new one
+    # should be created (closed). Default "4" matches HubSpot's default pipeline.
+    # Confirm in HubSpot → Settings → Objects → Tickets → Pipelines if customised.
+    HUBSPOT_TICKET_CLOSED_STAGE: str = "4"
+
+    # Auto-create a real HubSpot Task (appears in the rep's to-do queue) when the
+    # WhatsApp bot cannot answer a customer's question (reply_resolved=False).
+    # Requires crm.objects.tasks.write scope on the Private App.
+    HUBSPOT_TASKS_ENABLED: bool = True
+    # How many hours from the original message time the Task should be due.
+    HUBSPOT_TASK_DUE_OFFSET_HOURS: int = 24
 
     # ── AI kill switch (env-var seed only) ─────────────────────────────────────
     # This env-var seeds the app_settings.ai_enabled DB flag (migration 0011).

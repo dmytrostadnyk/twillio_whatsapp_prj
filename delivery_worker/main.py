@@ -36,6 +36,7 @@ import random
 import signal
 import sys
 import time
+from datetime import timedelta
 
 import httpx
 import structlog
@@ -47,12 +48,24 @@ from comm_layer.db import create_pool
 from comm_layer.logging_config import configure_logging
 from comm_layer.rate_limiter import RateLimitExceededError, TokenBucket
 from delivery_worker.hubspot_client import (
+    add_note_to_ticket,
+    create_note,
+    create_task,
     ensure_custom_properties,
     find_or_create_contact,
+    find_or_create_ticket,
     get_contact_log,
     update_contact,
 )
-from delivery_worker.transform import build_hubspot_properties
+from delivery_worker.transform import (
+    build_hubspot_properties,
+    build_task_body,
+    build_task_subject,
+    build_ticket_subject,
+    format_event_block,
+    should_create_task,
+    should_create_ticket,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -155,6 +168,65 @@ async def _persist_contact_id(pool, event_id, contact_id: str) -> None:
             contact_id,
             event_id,
         )
+
+
+async def _persist_note_id(pool, event_id, note_id: str) -> None:
+    """Persist the HubSpot Note id so retries skip Note creation (no duplicate notes)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE comm_events SET hubspot_note_id = $1 WHERE id = $2",
+            note_id,
+            event_id,
+        )
+
+
+async def _persist_ticket_id(pool, event_id, ticket_id: str) -> None:
+    """Persist the HubSpot Ticket id so retries skip Ticket creation (no duplicates)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE comm_events SET hubspot_ticket_id = $1 WHERE id = $2",
+            ticket_id,
+            event_id,
+        )
+
+
+async def _persist_task_id(pool, event_id, task_id: str) -> None:
+    """Persist the HubSpot Task id so retries skip Task creation (no duplicates)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE comm_events SET hubspot_task_id = $1 WHERE id = $2",
+            task_id,
+            event_id,
+        )
+
+
+async def _lookup_recent_ticket_for_phone(pool, phone: str) -> str | None:
+    """
+    Look up the most recent HubSpot ticket id for a phone number in our DB.
+
+    Used by Phase 4 to check whether an open ticket already exists for this
+    contact before creating a new one. Our DB is strongly consistent — unlike
+    HubSpot's search index which can lag writes by several seconds. This mirrors
+    the same approach used by _lookup_contact_id_by_phone.
+
+    Returns the ticket id string or None if no prior ticket is found.
+    """
+    if not phone:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT hubspot_ticket_id
+            FROM comm_events
+            WHERE REPLACE(from_number, 'whatsapp:', '') =
+                  REPLACE($1, 'whatsapp:', '')
+              AND hubspot_ticket_id IS NOT NULL
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            phone,
+        )
+    return row["hubspot_ticket_id"] if row else None
 
 
 async def _lookup_contact_id_by_phone(pool, phone: str) -> str | None:
@@ -453,6 +525,149 @@ async def process_message(
         log.warning("delivery.network_error_retry", error_type=error_type, backoff_seconds=backoff)
         return
 
+    # ── Phase 3: Create timeline Note (idempotent via hubspot_note_id) ─────────
+    # The contact PATCH already succeeded — this event is "delivered" to HubSpot.
+    # Note creation is best-effort: a failure nacks so we retry, but because the
+    # contact PATCH is idempotent the retry is safe.
+
+    if settings.HUBSPOT_NOTES_ENABLED and not msg.hubspot_note_id:
+        note_body = format_event_block(msg)
+        timestamp_ms = int(msg.created_at.timestamp() * 1000)
+        try:
+            note_id = await create_note(
+                http_client,
+                settings.HUBSPOT_PRIVATE_APP_TOKEN,
+                settings.HUBSPOT_BASE_URL,
+                contact_id,
+                note_body,
+                timestamp_ms,
+            )
+            await _persist_note_id(pool, msg.id, note_id)
+        except httpx.HTTPStatusError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await _handle_http_error(broker, msg, pool, exc.response, latency_ms)
+            return
+        except httpx.RequestError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            backoff = compute_backoff(msg.attempt_count)
+            error_type = type(exc).__name__
+            reason = f"{error_type}: {exc}"
+            await broker.nack(msg.id, reason, backoff)
+            await _write_delivery_log(
+                pool, msg.id, msg.correlation_id, msg.attempt_count,
+                status="failure", latency_ms=latency_ms, error_message=reason,
+            )
+            log.warning("delivery.note_network_error_retry",
+                        error_type=error_type, backoff_seconds=backoff)
+            return
+
+    # ── Phase 4: Auto-create or reuse Ticket for complaint / negative sentiment ──
+    # Only when the flag is on and we haven't already created one for this event.
+    # Dedupe: look up any prior ticket for this phone number in our DB first,
+    # then confirm via GET whether that ticket is still open. If open, reuse it
+    # and attach a Note inside the ticket so the rep sees the new message in context.
+    # If closed (or deleted), create a new one.
+
+    ticket_reused = False
+    if settings.HUBSPOT_TICKETS_ENABLED and not msg.hubspot_ticket_id and should_create_ticket(msg):
+        ticket_subject = build_ticket_subject(msg)
+        ticket_content = format_event_block(msg)
+        prior_ticket_id = await _lookup_recent_ticket_for_phone(pool, msg.from_number)
+        try:
+            ticket_id, ticket_reused = await find_or_create_ticket(
+                http_client,
+                settings.HUBSPOT_PRIVATE_APP_TOKEN,
+                settings.HUBSPOT_BASE_URL,
+                contact_id,
+                ticket_subject,
+                ticket_content,
+                settings.HUBSPOT_TICKET_PIPELINE,
+                settings.HUBSPOT_TICKET_PIPELINE_STAGE,
+                existing_ticket_id=prior_ticket_id,
+                closed_stage=settings.HUBSPOT_TICKET_CLOSED_STAGE,
+            )
+            # Persist immediately so retries skip Phase 4 entirely — even if the
+            # in-ticket Note below fails. The Note is cosmetic; the ticket record
+            # is the source of truth.
+            await _persist_ticket_id(pool, msg.id, ticket_id)
+        except httpx.HTTPStatusError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await _handle_http_error(broker, msg, pool, exc.response, latency_ms)
+            return
+        except httpx.RequestError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            backoff = compute_backoff(msg.attempt_count)
+            error_type = type(exc).__name__
+            reason = f"{error_type}: {exc}"
+            await broker.nack(msg.id, reason, backoff)
+            await _write_delivery_log(
+                pool, msg.id, msg.correlation_id, msg.attempt_count,
+                status="failure", latency_ms=latency_ms, error_message=reason,
+            )
+            log.warning("delivery.ticket_network_error_retry",
+                        error_type=error_type, backoff_seconds=backoff)
+            return
+
+        if ticket_reused:
+            # Best-effort: add a Note inside the reused ticket so the rep sees
+            # the new complaint message right where they're working the case.
+            # A failure here is not worth nacking — the contact timeline already
+            # has the full record via Phase 3.
+            timestamp_ms = int(msg.created_at.timestamp() * 1000)
+            try:
+                await add_note_to_ticket(
+                    http_client,
+                    settings.HUBSPOT_PRIVATE_APP_TOKEN,
+                    settings.HUBSPOT_BASE_URL,
+                    ticket_id,
+                    format_event_block(msg),
+                    timestamp_ms,
+                )
+            except (httpx.HTTPStatusError, httpx.RequestError):
+                log.warning(
+                    "delivery.ticket_note_best_effort_failed",
+                    ticket_id=ticket_id,
+                    event_key=msg.event_key,
+                )
+
+    # ── Phase 5: Create real Task for bot-can't-answer WhatsApp events ─────────
+    # Only when the flag is on and we haven't already created one for this event.
+    # The text line on ai_last_action_items stays — the Task is additive.
+
+    if settings.HUBSPOT_TASKS_ENABLED and not msg.hubspot_task_id and should_create_task(msg):
+        due_at_ms = int(
+            (msg.created_at + timedelta(hours=settings.HUBSPOT_TASK_DUE_OFFSET_HOURS))
+            .timestamp() * 1000
+        )
+        try:
+            task_id = await create_task(
+                http_client,
+                settings.HUBSPOT_PRIVATE_APP_TOKEN,
+                settings.HUBSPOT_BASE_URL,
+                contact_id,
+                build_task_subject(msg),
+                build_task_body(msg),
+                due_at_ms,
+            )
+            await _persist_task_id(pool, msg.id, task_id)
+        except httpx.HTTPStatusError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await _handle_http_error(broker, msg, pool, exc.response, latency_ms)
+            return
+        except httpx.RequestError as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            backoff = compute_backoff(msg.attempt_count)
+            error_type = type(exc).__name__
+            reason = f"{error_type}: {exc}"
+            await broker.nack(msg.id, reason, backoff)
+            await _write_delivery_log(
+                pool, msg.id, msg.correlation_id, msg.attempt_count,
+                status="failure", latency_ms=latency_ms, error_message=reason,
+            )
+            log.warning("delivery.task_network_error_retry",
+                        error_type=error_type, backoff_seconds=backoff)
+            return
+
     # ── Success ────────────────────────────────────────────────────────────────
 
     latency_ms = int((time.monotonic() - t0) * 1000)
@@ -461,6 +676,10 @@ async def process_message(
         "properties_updated": list(properties.keys()),
         "channel": msg.channel,
         "event_type": msg.event_type,
+        "note_created": settings.HUBSPOT_NOTES_ENABLED,
+        "ticket_created": settings.HUBSPOT_TICKETS_ENABLED and should_create_ticket(msg),
+        "ticket_reused": ticket_reused,
+        "task_created": settings.HUBSPOT_TASKS_ENABLED and should_create_task(msg),
     }
     await broker.ack(msg.id, contract_payload=ack_payload)
     await _write_delivery_log(
@@ -472,6 +691,10 @@ async def process_message(
         contact_id=contact_id,
         channel=msg.channel,
         http_status=response.status_code,
+        note_created=settings.HUBSPOT_NOTES_ENABLED and not msg.hubspot_note_id,
+        ticket_created=settings.HUBSPOT_TICKETS_ENABLED and should_create_ticket(msg),
+        ticket_reused=ticket_reused,
+        task_created=settings.HUBSPOT_TASKS_ENABLED and should_create_task(msg),
     )
 
 
