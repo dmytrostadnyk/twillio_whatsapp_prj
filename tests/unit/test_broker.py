@@ -176,7 +176,7 @@ async def test_ack_sets_delivered_status(mock_asyncpg_pool):
 
 @pytest.mark.asyncio
 async def test_ack_stores_contract_payload_when_provided(mock_asyncpg_pool):
-    """The contract payload sent to Azure must be stored in comm_events for auditability."""
+    """The contract payload delivered to the CRM must be stored in comm_events for auditability."""
     mock_pool, mock_conn = mock_asyncpg_pool
     broker = make_broker(mock_pool)
     event_id = uuid.uuid4()

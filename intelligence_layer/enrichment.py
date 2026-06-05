@@ -229,25 +229,28 @@ def _call_gpt4o_sync(content: str, event_type: str) -> EnrichmentData:
     """
     Make one synchronous GPT-4o call with structured output.
 
-    Uses client.beta.chat.completions.parse() which validates the response
-    against EnrichmentData automatically — raises if the model returns an
-    unexpected structure, which triggers a retry in the caller.
+    Uses client.responses.parse() which validates the response against
+    EnrichmentData automatically — raises if the model returns an unexpected
+    structure, which triggers a retry in the caller.
+    store=False: prevents customer message content from being retained on
+    OpenAI's servers (Responses API stores by default; Chat Completions did not).
     """
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
     user_message = f"event_type: {event_type}\n\n{content}"
 
-    completion = client.beta.chat.completions.parse(
+    response = client.responses.parse(
         model="gpt-4o",
-        messages=[
+        input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
-        response_format=EnrichmentData,
+        text_format=EnrichmentData,
         temperature=0,
+        store=False,
     )
 
-    result: EnrichmentData = completion.choices[0].message.parsed
+    result: EnrichmentData = response.output_parsed
 
     # Log a warning if GPT-4o returned an intent outside our closed taxonomy.
     # We still accept the row — this is an ops visibility signal, not a hard error.

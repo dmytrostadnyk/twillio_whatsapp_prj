@@ -23,6 +23,7 @@ We mock all asyncpg, OpenAI, and Twilio calls — no real network traffic.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +31,8 @@ import pytest
 from comm_layer.outbound import WindowExpiredError
 from intelligence_layer.prompt_guard import SAFE_FALLBACK_REPLY
 from intelligence_layer.whatsapp_reply import (
+    _MAX_RETRIES,
+    _generate_reply_with_retries,
     _sweep_stale_sending,
     _WhatsAppReply,
     claim_next,
@@ -478,3 +481,92 @@ async def test_handle_reply_persists_resolved_false_when_bot_could_not_answer():
     sent_sql, *sent_params = mock_conn.execute.call_args_list[1].args
     assert "sent" in sent_params, "Status must be 'sent'"
     assert False in sent_params, "resolved=False must be persisted in the 'sent' write"
+
+
+# ── Tests 14–17: _generate_reply_with_retries (Responses API call + None handling) ──
+#
+# These tests exercise the REAL function body (not the function-level mock the
+# handle_reply tests use), so they cover the OpenAI Responses API call shape and the
+# refusal-vs-truncation None handling added during the Responses API migration.
+
+
+def _fake_parse_response(parsed=None, status: str = "completed") -> SimpleNamespace:
+    """
+    Build a stand-in for client.responses.parse()'s return value.
+
+    The real object exposes .output_parsed (the Pydantic model or None) and .status.
+    A SimpleNamespace is enough because the code only reads those two attributes.
+    """
+    return SimpleNamespace(output_parsed=parsed, status=status)
+
+
+def test_generate_reply_happy_path_returns_parsed():
+    """Happy path: responses.parse returns a parsed object → the function returns it."""
+    reply = _WhatsAppReply(reply_text="We open at 8am.", resolved=True)
+    mock_client = MagicMock()
+    mock_client.responses.parse.return_value = _fake_parse_response(parsed=reply)
+
+    with patch("intelligence_layer.whatsapp_reply.OpenAI", return_value=mock_client):
+        result = _generate_reply_with_retries("What time do you open?", [], "evt-1")
+
+    assert result is reply
+    assert mock_client.responses.parse.call_count == 1  # no retry on success
+
+    # Verify the new Responses API call shape (would catch a regression to the old API).
+    kwargs = mock_client.responses.parse.call_args.kwargs
+    assert kwargs["text_format"] is _WhatsAppReply
+    assert kwargs["store"] is False
+    assert kwargs["max_output_tokens"] == 500
+    assert isinstance(kwargs["input"], list)
+
+
+def test_generate_reply_refusal_fails_fast_without_retry():
+    """
+    status='completed' with output_parsed=None means the model refused. Retrying the
+    same input just refuses again, so the function must return None on the FIRST attempt.
+    """
+    mock_client = MagicMock()
+    mock_client.responses.parse.return_value = _fake_parse_response(
+        parsed=None, status="completed"
+    )
+
+    with patch("intelligence_layer.whatsapp_reply.OpenAI", return_value=mock_client):
+        result = _generate_reply_with_retries("disallowed request", [], "evt-2")
+
+    assert result is None
+    assert mock_client.responses.parse.call_count == 1  # fail fast — NO retry
+
+
+def test_generate_reply_truncation_retries_then_returns_none():
+    """
+    status='incomplete' (output truncated, e.g. hit max_output_tokens) is retryable.
+    The function must retry every attempt, then return None when all attempts fail.
+    """
+    mock_client = MagicMock()
+    mock_client.responses.parse.return_value = _fake_parse_response(
+        parsed=None, status="incomplete"
+    )
+
+    with (
+        patch("intelligence_layer.whatsapp_reply.OpenAI", return_value=mock_client),
+        patch("intelligence_layer.whatsapp_reply.time.sleep"),  # don't sleep in tests
+    ):
+        result = _generate_reply_with_retries("a very long question", [], "evt-3")
+
+    assert result is None
+    assert mock_client.responses.parse.call_count == _MAX_RETRIES + 1  # retried each attempt
+
+
+def test_generate_reply_exception_retries_then_returns_none():
+    """If responses.parse raises (e.g. network error), the function retries then None."""
+    mock_client = MagicMock()
+    mock_client.responses.parse.side_effect = RuntimeError("API down")
+
+    with (
+        patch("intelligence_layer.whatsapp_reply.OpenAI", return_value=mock_client),
+        patch("intelligence_layer.whatsapp_reply.time.sleep"),
+    ):
+        result = _generate_reply_with_retries("hello", [], "evt-4")
+
+    assert result is None
+    assert mock_client.responses.parse.call_count == _MAX_RETRIES + 1

@@ -549,9 +549,11 @@ def _generate_reply_with_retries(
     Synchronous wrapper (for asyncio.to_thread) that calls GPT-4o up to
     MAX_RETRIES + 1 times. Returns a _WhatsAppReply or None if all attempts fail.
 
-    WHY structured output: using client.beta.chat.completions.parse() guarantees
-    we get a Pydantic-validated {reply_text, resolved} object. resolved=False means
-    the bot couldn't answer — the delivery worker injects a CRM follow-up action item.
+    WHY structured output: using client.responses.parse() guarantees we get a
+    Pydantic-validated {reply_text, resolved} object. resolved=False means the
+    bot couldn't answer — the delivery worker injects a CRM follow-up action item.
+    store=False: prevents customer message content from being retained on OpenAI's
+    servers (Responses API stores by default; Chat Completions did not).
 
     WHY sync: OpenAI's Python SDK is synchronous. We run it in a thread pool
     via asyncio.to_thread so the event loop is not blocked.
@@ -573,14 +575,32 @@ def _generate_reply_with_retries(
     for attempt in range(_MAX_RETRIES + 1):
         try:
             client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            completion = client.beta.chat.completions.parse(
+            response = client.responses.parse(
                 model="gpt-4o",
-                messages=messages,
-                response_format=_WhatsAppReply,
-                temperature=0.4,   # slightly creative for natural replies, not 0
-                max_tokens=500,    # ~300 words reply + overhead for structured fields
+                input=messages,
+                text_format=_WhatsAppReply,
+                temperature=0.4,        # slightly creative for natural replies, not 0
+                max_output_tokens=500,  # ~300 words reply + overhead for structured fields
+                store=False,
             )
-            return completion.choices[0].message.parsed
+            parsed = response.output_parsed
+            if parsed is None:
+                # No parsed object came back. Two distinct causes need different handling:
+                #   status == "incomplete"  → output was truncated (e.g. hit
+                #       max_output_tokens). A retry may succeed, so raise to retry.
+                #   otherwise (status "completed") → the model refused to answer.
+                #       Retrying identical input just refuses again, so fail fast
+                #       (return None → caller records 'failed') to avoid wasted calls
+                #       and extra latency for the customer.
+                if response.status == "incomplete":
+                    raise ValueError("responses.parse output incomplete; retrying")
+                log.warning(
+                    "whatsapp_reply.model_refused_no_retry",
+                    comm_event_id=comm_event_id,
+                    status=response.status,
+                )
+                return None
+            return parsed
 
         except Exception as exc:
             log.warning(

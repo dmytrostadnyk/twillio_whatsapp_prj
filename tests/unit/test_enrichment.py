@@ -66,10 +66,9 @@ def make_gpt4o_response(
     action_items: list | None = None,
 ) -> SimpleNamespace:
     """
-    Build a mock return value for client.beta.chat.completions.parse().
+    Build a mock return value for client.responses.parse().
 
-    The real API returns an object where .choices[0].message.parsed is the
-    Pydantic model instance.
+    The real API returns an object where .output_parsed is the Pydantic model instance.
     """
     from comm_layer.contracts.enriched import ActionItem, EnrichmentData, Entity
 
@@ -85,9 +84,7 @@ def make_gpt4o_response(
         entities=entities,
         action_items=action_items,
     )
-    message = SimpleNamespace(parsed=parsed)
-    choice = SimpleNamespace(message=message)
-    return SimpleNamespace(choices=[choice])
+    return SimpleNamespace(output_parsed=parsed)
 
 
 def make_mock_pool_for_enrichment():
@@ -235,7 +232,7 @@ async def test_enrich_event_sms_happy_path():
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
             mock_client = MagicMock()
-            mock_client.beta.chat.completions.parse.return_value = gpt4o_response
+            mock_client.responses.parse.return_value = gpt4o_response
             mock_openai_cls.return_value = mock_client
 
             await enrich_event(pool=mock_pool, supabase=None, event=event)
@@ -270,14 +267,12 @@ async def test_enrich_event_voice_uses_transcript_text():
         entities=[],
         action_items=[ActionItem(description="Process cancellation", priority="high")],
     )
-    gpt4o_response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))]
-    )
+    gpt4o_response = SimpleNamespace(output_parsed=parsed)
 
     captured_messages = []
 
     def fake_parse(**kwargs):
-        captured_messages.extend(kwargs["messages"])
+        captured_messages.extend(kwargs["input"])
         return gpt4o_response
 
     with patch("intelligence_layer.enrichment.settings") as mock_settings:
@@ -285,7 +280,7 @@ async def test_enrich_event_voice_uses_transcript_text():
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
             mock_client = MagicMock()
-            mock_client.beta.chat.completions.parse.side_effect = fake_parse
+            mock_client.responses.parse.side_effect = fake_parse
             mock_openai_cls.return_value = mock_client
 
             await enrich_event(pool=mock_pool, supabase=None, event=event)
@@ -323,13 +318,13 @@ async def test_enrich_event_retries_then_marks_failed():
 
         with patch("intelligence_layer.enrichment.OpenAI") as mock_openai_cls:
             mock_client = MagicMock()
-            mock_client.beta.chat.completions.parse.side_effect = RuntimeError("API error")
+            mock_client.responses.parse.side_effect = RuntimeError("API error")
             mock_openai_cls.return_value = mock_client
 
             with patch("intelligence_layer.enrichment.time.sleep", side_effect=fake_sleep):
                 await enrich_event(pool=mock_pool, supabase=None, event=event)
 
-    assert mock_client.beta.chat.completions.parse.call_count == 3
+    assert mock_client.responses.parse.call_count == 3
     assert len(sleep_calls) == 2
     from intelligence_layer.enrichment import RETRY_SLEEP_SECONDS
     assert all(s == RETRY_SLEEP_SECONDS for s in sleep_calls)

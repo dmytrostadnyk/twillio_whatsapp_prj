@@ -206,9 +206,9 @@ def _classify_input(text: str, *, correlation_id: str = "") -> str:
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
         truncated = text[:_CLASSIFIER_MAX_CHARS]
 
-        completion = client.beta.chat.completions.parse(
+        response = client.responses.parse(
             model=settings.WHATSAPP_GUARD_MODEL,
-            messages=[
+            input=[
                 {
                     "role": "system",
                     "content": (
@@ -225,10 +225,11 @@ def _classify_input(text: str, *, correlation_id: str = "") -> str:
                 },
                 {"role": "user", "content": truncated},
             ],
-            response_format=_GuardVerdict,
+            text_format=_GuardVerdict,
             temperature=0,
+            store=False,
         )
-        result = completion.choices[0].message.parsed
+        result = response.output_parsed
         return result.verdict
 
     except Exception:

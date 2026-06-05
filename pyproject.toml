@@ -20,7 +20,7 @@ dependencies = [
     # ── Telephony ──────────────────────────────────────────────────────────────
     "twilio>=9.3.0",
     # ── AI providers ───────────────────────────────────────────────────────────
-    "openai>=1.55.0",           # GPT-4o enrichment + embeddings + Whisper transcription
+    "openai>=2.0.0",            # GPT-4o enrichment + embeddings + Whisper transcription; Responses API requires 2.x
     "cohere>=5.11.0",           # semantic search reranking
     # ── HTTP client (workers making outbound requests) ─────────────────────────
     "httpx>=0.28.0",
