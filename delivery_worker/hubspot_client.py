@@ -452,7 +452,7 @@ async def find_or_create_ticket(
     - Ticket is still open (stage != closed_stage) → return (id, True)
     - Ticket is closed or 404 (deleted) → fall through and create a new one.
 
-    Requires crm.objects.tickets.write + crm.objects.tickets.read scopes.
+    Requires the "tickets" scope on the Private App (single scope covers read + write).
     Raises httpx.HTTPStatusError on non-2xx (except 404 which is handled internally).
     """
     headers = _auth_headers(token)
@@ -526,7 +526,7 @@ async def create_task(
     due_at_ms: Unix timestamp in milliseconds for the task due date.
     Association typeId 204 is HUBSPOT_DEFINED for task→contact.
 
-    Requires crm.objects.tasks.write scope on the Private App.
+    Requires crm.objects.contacts.write scope (tasks/engagements use the contacts scope).
     Raises httpx.HTTPStatusError on non-2xx.
     """
     headers = _auth_headers(token)

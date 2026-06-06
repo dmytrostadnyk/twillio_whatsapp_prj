@@ -29,20 +29,20 @@ HOW TO USE:
        say -o /tmp/demo.aiff "I need to cancel my subscription. I was charged twice."
        ffmpeg -i /tmp/demo.aiff tests/fixtures/sample_call.mp3 -y
 
-  2. Start all four services in separate terminals:
+  2. Start three services in separate terminals:
        uvicorn comm_layer.main:app --host 0.0.0.0 --port 8000 --reload
        make intel
        make worker
-       make mock-crm
 
   3. Run this script:
        python scripts/simulate_call.py
 
-  4. Wait ~30 seconds, then check Supabase:
-       comm_events  → 3 rows (call.started, call.completed, recording.ready)
-       transcripts  → Whisper transcript text
-       enrichments  → GPT-4o intent / sentiment / summary
-       delivery_log → delivery attempt to mock CRM
+  4. Wait ~30 seconds, then check:
+       Supabase comm_events  → 3 rows (call.started, call.completed, recording.ready)
+       Supabase transcripts  → Whisper transcript text
+       Supabase enrichments  → GPT-4o intent / sentiment / summary
+       HubSpot               → contact updated with AI fields, Note on timeline,
+                               Ticket created if complaint/negative sentiment
 """
 
 from __future__ import annotations
