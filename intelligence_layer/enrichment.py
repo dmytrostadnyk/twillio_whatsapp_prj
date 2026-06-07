@@ -279,17 +279,12 @@ async def _update_enrichment(pool, comm_event_id: str, *, status: str, **fields)
     the failure path only needs status + failure_reason. One function handles both
     by building the SET clause dynamically from the passed fields.
     """
-    import json as _json
-
     # Build the dynamic SET clause: status is always updated; other fields only
     # if passed. Using parameterised values avoids any SQL injection risk.
     set_parts = ["status = $2", "updated_at = NOW()"]
     params: list = [comm_event_id, status]
 
     for key, value in fields.items():
-        # JSONB columns (entities, action_items) must be passed as JSON strings.
-        if isinstance(value, (list, dict)):
-            value = _json.dumps(value)
         params.append(value)
         set_parts.append(f"{key} = ${len(params)}")
 
