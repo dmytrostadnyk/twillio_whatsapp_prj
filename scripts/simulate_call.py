@@ -52,6 +52,7 @@ import base64
 import hashlib
 import hmac
 import http.server
+import secrets
 import sys
 import threading
 import time
@@ -186,9 +187,10 @@ def main() -> None:
     _start_file_server(str(fixture.parent), FILE_SERVER_PORT)
     recording_url = f"http://localhost:{FILE_SERVER_PORT}/sample_call"
 
-    # Fake but structurally valid Twilio SIDs (34-char strings, CA/RE prefix)
-    call_sid = "CA" + "a1b2c3d4e5f6" * 2 + "a1b2c3d4"
-    recording_sid = "RE" + "f6e5d4c3b2a1" * 2 + "f6e5d4c3"
+    # Random SIDs so each simulation run is treated as a fresh call by the
+    # idempotency guard (which deduplicates on event_key = SID + event_type).
+    call_sid = "CA" + secrets.token_hex(16)
+    recording_sid = "RE" + secrets.token_hex(16)
 
     # Common fields Twilio always includes on voice webhooks
     base_voice = {
