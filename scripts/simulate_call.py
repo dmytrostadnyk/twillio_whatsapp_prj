@@ -183,9 +183,8 @@ def main() -> None:
     print()
 
     # Serve the MP3 on a background thread so transcription can download it.
-    # URL the transcription code will download: http://localhost:8002/sample_call.mp3
     _start_file_server(str(fixture.parent), FILE_SERVER_PORT)
-    recording_url = f"http://localhost:{FILE_SERVER_PORT}/sample_call"
+    recording_url = f"http://localhost:{FILE_SERVER_PORT}/{fixture.stem}"
 
     # Random SIDs so each simulation run is treated as a fresh call by the
     # idempotency guard (which deduplicates on event_key = SID + event_type).
