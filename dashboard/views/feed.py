@@ -97,7 +97,7 @@ def show() -> None:
 
     # Show the summary table — drop internal _enrichment column
     display_df = df[_TABLE_COLUMNS].copy()
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width="stretch", hide_index=True)
 
     st.divider()
     st.subheader("Event detail")

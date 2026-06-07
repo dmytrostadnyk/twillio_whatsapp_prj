@@ -100,7 +100,7 @@ def show() -> None:
             "created_at", "event_key", "channel", "event_type",
             "attempt_count", "last_error"
         ]]
-        st.dataframe(dlq_df, use_container_width=True, hide_index=True)
+        st.dataframe(dlq_df, width="stretch", hide_index=True)
 
     st.divider()
 

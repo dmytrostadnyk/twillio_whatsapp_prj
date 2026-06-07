@@ -155,4 +155,4 @@ def show() -> None:
     if failures:
         st.subheader(f"Enrichment failures ({len(failures)})")
         failure_df = pd.DataFrame(failures)[["intent", "sentiment", "failure_reason"]]
-        st.dataframe(failure_df, use_container_width=True, hide_index=True)
+        st.dataframe(failure_df, width="stretch", hide_index=True)

@@ -111,7 +111,7 @@ def show() -> None:
         })
 
     st.success(f"Found {len(results)} result(s)")
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    st.dataframe(display_rows, width="stretch", hide_index=True)
 
     # Full content for each result under individual expanders
     st.divider()
